@@ -1,0 +1,9 @@
+# Your real app map — never commit
+apps.json
+.rc-clean/
+# Secrets / auth
+asc_credentials
+*auth_token*
+*.p8
+__pycache__/
+*.pyc

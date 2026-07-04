@@ -1,0 +1,4 @@
+{
+  "com.example.myapp":    {"rc": "<revenuecat-project-id>", "asc": "<app-store-connect-app-id>", "name": "My App"},
+  "com.example.otherapp": {"rc": "<revenuecat-project-id>", "asc": "<app-store-connect-app-id>", "name": "Other App"}
+}

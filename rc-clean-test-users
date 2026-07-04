@@ -1,0 +1,296 @@
+#!/usr/bin/env python3
+"""
+rc-clean-test-users — remove RevenueCat *test* customers for the current app.
+
+A "test" customer is one we can prove is NOT a real App Store buyer:
+  * the app has never been released (any customer must be TestFlight/sim), OR
+  * the customer's last-seen app version was never public on the App Store
+    (a build still in review / prepare, or a phantom TestFlight-only version).
+This pairs RevenueCat's per-customer version with Apple's release states, so it
+stays correct as builds get approved. Anyone with a real (non-sandbox) purchase
+is NEVER touched. The pre-release-timestamp heuristic is deliberately NOT used —
+it would wrongly flag loyal users who installed early and updated to the latest
+build (RevenueCat only exposes last-seen version, not install version).
+
+Run it from inside an app's repo (auto-detects the app from its bundle id):
+    rc-clean-test-users            # dry run: list what WOULD be deleted
+    rc-clean-test-users --delete   # actually delete
+    rc-clean-test-users --all-apps # every configured app (dry run unless --delete)
+
+Auth:
+  * App Store Connect: ~/.baseball_credentials (ASC_API_KEY_ID/ISSUER_ID/KEY_PATH)
+  * RevenueCat: ~/.revenuecat/auth_token (a dashboard token; self-refreshes).
+    If it ever expires, log in at app.revenuecat.com and reseed with:
+      rc-clean-test-users --reseed <authentication_token>
+    (get the token from the dashboard: DevTools > run
+     fetch('/v1/developers/login/refresh-token',{method:'POST',
+     headers:{'X-Requested-With':'XMLHttpRequest'},credentials:'include'})
+     .then(r=>r.json()).then(d=>copy(d.authentication_token)) )
+"""
+import os, sys, re, json, time, argparse, datetime, subprocess, urllib.parse
+import jwt, requests
+
+RC = "https://app.revenuecat.com"
+ASC = "https://api.appstoreconnect.apple.com"
+def die(msg, code=1):
+    print(f"error: {msg}", file=sys.stderr); sys.exit(code)
+
+def _first_existing(*paths, default=None):
+    for p in paths:
+        if not p: continue
+        p = os.path.expanduser(os.path.expandvars(p))
+        if os.path.exists(p): return p
+    return os.path.expanduser(os.path.expandvars(default)) if default else None
+
+TOKEN_FILE = os.path.expanduser(os.path.expandvars(
+    os.environ.get("RC_CLEAN_TOKEN", "~/.revenuecat/auth_token")))
+
+# App Store Connect API creds (a shell-style file exporting ASC_API_KEY_ID /
+# ASC_ISSUER_ID / ASC_KEY_PATH). Override with $RC_CLEAN_ASC_CREDS.
+ASC_CREDS = _first_existing(os.environ.get("RC_CLEAN_ASC_CREDS"),
+                            "~/.rc-clean/asc_credentials",
+                            "~/.baseball_credentials",
+                            default="~/.rc-clean/asc_credentials")
+
+# bundle id -> {rc: RevenueCat project id, asc: App Store Connect app id, name}.
+# Loaded from JSON so no private app list is baked into the tool. Search order:
+# $RC_CLEAN_APPS, ~/.rc-clean/apps.json, apps.json / apps.example.json beside this file.
+def load_apps():
+    here = os.path.dirname(os.path.abspath(__file__))
+    for c in (os.environ.get("RC_CLEAN_APPS"), "~/.rc-clean/apps.json",
+              os.path.join(here, "apps.json"), os.path.join(here, "apps.example.json")):
+        if not c: continue
+        p = os.path.expanduser(os.path.expandvars(c))
+        if os.path.exists(p):
+            with open(p) as f: data = json.load(f)
+            if data: return data
+    die('no apps config found. Create ~/.rc-clean/apps.json (see apps.example.json):\n'
+        '  { "com.you.app": {"rc": "<rc project id>", "asc": "<asc app id>", "name": "App"} }')
+
+APPS = {}  # populated in main()
+
+# ---------- app detection ----------
+def _match_bundle(text):
+    """Pick the base-app bundle id from project text (shortest = no .watch/.widget suffix)."""
+    hits = [b for b in APPS if b in text]
+    hits.sort(key=len)
+    return hits[0] if hits else None
+
+def detect_bundle():
+    """Find this app's base bundle id by walking UP from the cwd to the nearest
+    project.yml / *.xcodeproj. Deliberately does NOT trust `git rev-parse
+    --show-toplevel`: the home dir is itself a git repo with every app nested
+    inside it, so the git root is useless for telling the apps apart."""
+    home = os.path.expanduser("~")
+    d = os.getcwd()
+    while True:
+        # the home dir (and anything above it) is ambiguous: every app is nested
+        # under it, so refuse rather than silently guess. Use --all-apps there.
+        at_home = os.path.normpath(d) == os.path.normpath(home)
+        # nearest project.yml wins — this is the per-app manifest
+        for name in ("project.yml", "Project.yml"):
+            p = os.path.join(d, name)
+            if os.path.exists(p):
+                b = _match_bundle(open(p, errors="ignore").read())
+                if b: return b
+        # fall back to a bounded scan of THIS app's project files (non-XcodeGen repos)
+        if not at_home:
+            text = ""
+            for dirpath, dirs, files in os.walk(d):
+                # prune: never descend into .git or into a nested/sibling app repo
+                dirs[:] = [x for x in dirs if x != ".git" and not any(
+                    os.path.exists(os.path.join(dirpath, x, m))
+                    for m in ("project.yml", "Project.yml"))]
+                for f in files:
+                    if f.endswith((".pbxproj", "Info.plist")):
+                        try: text += open(os.path.join(dirpath, f), errors="ignore").read()
+                        except Exception: pass
+            b = _match_bundle(text)
+            if b: return b
+        parent = os.path.dirname(d)
+        if at_home or parent == d:  # stop at home / filesystem root
+            return None
+        d = parent
+
+# ---------- App Store Connect ----------
+def asc_token():
+    env = {}
+    for line in open(ASC_CREDS, errors="ignore"):
+        m = re.match(r'\s*export\s+(\w+)="?([^"\n]+)"?', line)
+        if m: env[m.group(1)] = m.group(2)
+    key = open(os.path.expanduser(os.path.expandvars(env["ASC_KEY_PATH"]))).read()
+    now = int(time.time())
+    return jwt.encode({"iss": env["ASC_ISSUER_ID"], "iat": now, "exp": now + 900,
+                       "aud": "appstoreconnect-v1"}, key, algorithm="ES256",
+                      headers={"kid": env["ASC_API_KEY_ID"], "typ": "JWT"})
+
+def released_versions(asc_app_id):
+    """Return set of canonical versionStrings that are currently READY_FOR_SALE."""
+    h = {"Authorization": f"Bearer {asc_token()}"}
+    r = requests.get(f"{ASC}/v1/apps/{asc_app_id}/appStoreVersions"
+                     "?limit=50&fields[appStoreVersions]=versionString,appStoreState", headers=h)
+    r.raise_for_status()
+    rel = set()
+    for v in r.json().get("data", []):
+        a = v["attributes"]
+        if a["appStoreState"] == "READY_FOR_SALE":
+            rel.add(canon(a["versionString"]))
+    return rel
+
+def canon(v):
+    if not v: return ""
+    parts = [int(x) if x.isdigit() else 0 for x in str(v).split(".")]
+    while len(parts) > 1 and parts[-1] == 0: parts.pop()
+    return ".".join(map(str, parts))
+
+# ---------- RevenueCat (dashboard token, self-refreshing) ----------
+class RC_API:
+    def __init__(self):
+        if not os.path.exists(TOKEN_FILE):
+            die(f"no RevenueCat token at {TOKEN_FILE}; reseed with --reseed <token>")
+        self.token = open(TOKEN_FILE).read().strip()
+        self._refresh()
+
+    def _refresh(self):
+        r = requests.post(f"{RC}/v1/developers/login/refresh-token",
+                          headers=self._h(), json={})
+        if r.status_code != 200:
+            die("RevenueCat token expired/invalid; reseed with --reseed <token> "
+                "(see header comment for how to get one)")
+        self.token = r.json()["authentication_token"]
+        with open(TOKEN_FILE, "w") as f: f.write(self.token)
+        os.chmod(TOKEN_FILE, 0o600)
+
+    def _h(self):
+        return {"X-Requested-With": "XMLHttpRequest", "Authorization": f"Bearer {self.token}"}
+
+    def get(self, path, **kw):
+        return requests.get(f"{RC}{path}", headers=self._h(), **kw)
+
+    def post(self, path, **kw):
+        return requests.post(f"{RC}{path}", headers=self._h(), **kw)
+
+    def delete(self, path):
+        return requests.delete(f"{RC}{path}", headers=self._h())
+
+    # enumerate every customer first-seen in [start,end); recursively split to beat the 100-row cap
+    def enumerate_customers(self, pid, start, end, depth=0):
+        spec = {"rule_groups": [{"order": 1, "rule_operator": "AND", "children": [
+            {"field": "first_seen_at", "operator": ">=", "rule_type": "date", "value": start},
+            {"field": "first_seen_at", "operator": "<",  "rule_type": "date", "value": end}]}]}
+        r = self.post(f"/internal/v1/developers/me/subscriber_lists",
+                      json={"app_uuid": pid, "label": "__rcclean_tmp", "list_spec": spec})
+        lid = r.json()["uuid"]
+        rows = []
+        try:
+            for _ in range(30):
+                j = self.get(f"/internal/v1/developers/me/subscriber_lists/{lid}").json()
+                if j.get("preview_status") == "idle":
+                    rows = j.get("preview_rows", []); break
+                time.sleep(1.2)
+        finally:
+            self.delete(f"/internal/v1/developers/me/subscriber_lists/{lid}")
+        if len(rows) >= 100 and depth < 8:
+            # window too big: split in half by date and recurse
+            ds = datetime.date.fromisoformat(start); de = datetime.date.fromisoformat(end)
+            mid = ds + (de - ds) / 2
+            if mid > ds:
+                return (self.enumerate_customers(pid, start, mid.isoformat(), depth + 1) +
+                        self.enumerate_customers(pid, mid.isoformat(), end, depth + 1))
+        return [r["app_user_id"] for r in rows]
+
+    def customer(self, pid, app_user_id):
+        r = self.get(f"/v1/developers/me/projects/{pid}/subscribers/"
+                     f"{urllib.parse.quote(app_user_id, safe='')}?sandbox_mode=false")
+        return r.json().get("subscriber") if r.status_code == 200 else None
+
+    def delete_customer(self, pid, app_user_id):
+        r = self.delete(f"/v1/developers/me/projects/{pid}/subscribers/"
+                        f"{urllib.parse.quote(app_user_id, safe='')}")
+        return r.status_code in (200, 202, 204)
+
+# ---------- core ----------
+def clean_app(rc, bundle, do_delete):
+    app = APPS[bundle]
+    pid, name = app["rc"], app["name"]
+    released = released_versions(app["asc"])
+    never_public = len(released) == 0
+    print(f"\n=== {name}  (RC {pid})  bundle {bundle} ===")
+    print(f"released versions: {sorted(released) if released else 'NONE — app not public'}")
+
+    ids = rc.enumerate_customers(pid, "2026-01-01",
+                                 (datetime.date.today() + datetime.timedelta(days=1)).isoformat())
+    print(f"scanning {len(ids)} customers...")
+
+    test, kept_purchasers, real = [], 0, 0
+    for i, uid in enumerate(ids):
+        s = rc.customer(pid, uid)
+        if not s:
+            # detail unfetchable (ghost / anonymous $RCAnonymousID record whose
+            # GET 404s but is still enumerated and still counts on the chart).
+            # If the app was never public it cannot be a real buyer, so it's test.
+            if never_public:
+                test.append((uid, "(no detail)", ""))
+            continue
+        has_real_purchase = any(h.get("product") and h.get("is_sandbox") is False
+                                for h in s.get("history", []))
+        if has_real_purchase:
+            kept_purchasers += 1; continue
+        ver = s.get("last_seen_app_version")
+        is_test = never_public or (canon(ver) not in released)
+        if is_test:
+            test.append((uid, ver or "(none)", (s.get("created_at") or "")[:10]))
+        else:
+            real += 1
+        time.sleep(0.08)
+
+    print(f"  real (kept): {real}   purchasers (kept): {kept_purchasers}   TEST: {len(test)}")
+    from collections import Counter
+    byver = Counter(v for _, v, _ in test)
+    if byver:
+        print("  test by version: " + ", ".join(f"{v}×{n}" for v, n in byver.most_common()))
+    for uid, ver, first in test[:200]:
+        print(f"    {'DELETE' if do_delete else 'would delete'}  {uid[:44]:44}  v{ver:10} first={first}")
+
+    if do_delete and test:
+        ok = 0
+        for uid, _, _ in test:
+            if rc.delete_customer(pid, uid): ok += 1
+            time.sleep(0.15)
+        print(f"  deleted {ok}/{len(test)}")
+    elif test:
+        print(f"  (dry run — pass --delete to remove these {len(test)})")
+    return len(test)
+
+def main():
+    ap = argparse.ArgumentParser(description="Delete RevenueCat test customers for the current app.")
+    ap.add_argument("--delete", action="store_true", help="actually delete (default: dry run)")
+    ap.add_argument("--all-apps", action="store_true", help="run for every configured app")
+    ap.add_argument("--reseed", metavar="TOKEN", help="store a fresh RevenueCat dashboard token and exit")
+    args = ap.parse_args()
+
+    if args.reseed:
+        os.makedirs(os.path.dirname(TOKEN_FILE), exist_ok=True)
+        with open(TOKEN_FILE, "w") as f: f.write(args.reseed.strip())
+        os.chmod(TOKEN_FILE, 0o600)
+        print(f"stored token to {TOKEN_FILE}"); return
+
+    global APPS
+    APPS = load_apps()
+
+    rc = RC_API()
+    if args.all_apps:
+        total = 0
+        for bundle in APPS:
+            total += clean_app(rc, bundle, args.delete)
+        print(f"\nTOTAL test customers {'deleted' if args.delete else 'found'}: {total}")
+        return
+
+    bundle = detect_bundle()
+    if not bundle:
+        die("couldn't detect the app from this folder. cd into an app repo, or use --all-apps.\n"
+            "known bundles: " + ", ".join(APPS))
+    clean_app(rc, bundle, args.delete)
+
+if __name__ == "__main__":
+    main()
