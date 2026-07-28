@@ -156,7 +156,7 @@ def asc_inventory(asc_app_id):
                  {"limit": 50, "include": "build"})
     by_id = {b["id"]: b["attributes"] for b in j.get("included", [])
              if b["type"] == "builds"}
-    store, released, pending = [], set(), set()
+    store, released, pending, live_uploaded_dates = [], set(), set(), []
     for v in j.get("data", []):
         a = v["attributes"]
         ver, state = a.get("versionString") or "", a.get("appStoreState") or ""
@@ -166,13 +166,17 @@ def asc_inventory(asc_app_id):
         if rel and build_num is None:
             try:
                 bj = _asc_get(f"/v1/builds/{rel['id']}", h)
-                build_num = bj["data"]["attributes"].get("version")
+                battrs = bj["data"]["attributes"]
+                build_num = battrs.get("version")
             except Exception:
                 pass
         c = canon(ver)
         store.append({"version": ver, "canon": c, "state": state, "build": build_num})
         if state == "READY_FOR_SALE":
             released.add(c)
+            up = battrs.get("uploadedDate")
+            if up:
+                live_uploaded_dates.append(up)
         elif c:
             pending.add(c)
 
@@ -215,8 +219,9 @@ def asc_inventory(asc_app_id):
         if c and c not in released:
             tf_only.add(c)
 
+    earliest_live_upload = min(live_uploaded_dates) if live_uploaded_dates else None
     return {"released": released, "pending": pending, "tf_only": tf_only,
-            "store": store, "tf": tf}
+            "store": store, "tf": tf, "earliest_live_upload": earliest_live_upload}
 
 # ---------- RevenueCat (dashboard token, self-refreshing) ----------
 class RC_API:
@@ -325,6 +330,8 @@ def clean_app(rc, bundle, do_delete, since_days=None, created_before=None):
     inv = asc_inventory(app["asc"])
     released, pending, tf_only = inv["released"], inv["pending"], inv["tf_only"]
     never_public = len(released) == 0
+    earliest_live_upload = inv.get("earliest_live_upload")
+    earliest_live_date = earliest_live_upload[:10] if earliest_live_upload else None
     # anything not READY_FOR_SALE is test — pending submissions + TF-only builds
     test_versions = pending | tf_only
 
@@ -338,6 +345,8 @@ def clean_app(rc, bundle, do_delete, since_days=None, created_before=None):
     _log(f"window: {start.isoformat()} → {end.isoformat()}  "
          f"({'last '+str(since_days)+'d' if since_days is not None else 'YTD'})")
     _log(f"released (READY_FOR_SALE): {sorted(released) if released else 'NONE — app not public'}")
+    if earliest_live_date:
+        _log(f"first live build upload: {earliest_live_upload[:19]}")
     if pending:
         _log(f"submitted not live:     {sorted(pending)}")
     if tf_only:
@@ -363,8 +372,8 @@ def clean_app(rc, bundle, do_delete, since_days=None, created_before=None):
         if not s:
             # detail unfetchable (ghost / anonymous $RCAnonymousID record whose
             # GET 404s but is still enumerated and still counts on the chart).
-            # If the app was never public it cannot be a real buyer, so it's test.
-            if never_public or created_before:
+            # If the app was never public or has an earliest live date, flag as ghost test record.
+            if never_public or created_before or earliest_live_date:
                 test.append((uid, "(no detail)", "", "ghost"))
             continue
         if _has_real_purchase(s):
@@ -374,6 +383,8 @@ def clean_app(rc, bundle, do_delete, since_days=None, created_before=None):
         reason = None
         created_str = (s.get("created_at") or "")[:10]
         if never_public:
+            reason = "pre-release"
+        elif earliest_live_date and created_str and created_str < earliest_live_date:
             reason = "pre-release"
         elif created_before and created_str and created_str < created_before:
             reason = "pre-approval"
