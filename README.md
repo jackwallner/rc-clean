@@ -10,18 +10,20 @@ deletes exactly those, and leaves everyone else alone.
 
 A customer is **test** only if you can *prove* they are not a real App Store
 buyer. `rc-clean` pairs each RevenueCat customer's last-seen app version against
-Apple's App Store release states:
+Apple's App Store submissions **and** TestFlight build inventory:
 
 - The app has **never been released** → any customer must be TestFlight/sim.
-- The customer's last-seen version was **never `READY_FOR_SALE`** on the App
-  Store (a build still in review, or a phantom TestFlight-only version) → test.
+- The customer's last-seen version was **never `READY_FOR_SALE`** — including
+  TF-only marketing versions (from ASC builds) and versions still in review /
+  prepare → test.
+- Sandbox-only purchasers (no real App Store purchase) → test.
 - **Anyone with a real (non-sandbox) purchase is never deleted**, full stop.
 
-Because it re-checks Apple's live release states on every run, it self-corrects
-as builds get approved. It deliberately does **not** use the tempting
-"first-seen before the release date" heuristic: RevenueCat only exposes
-*last-seen* version, not install version, so that would wrongly flag loyal users
-who installed early and updated to the latest build.
+Because it re-checks Apple's live release states and TF builds on every run, it
+self-corrects as builds get approved. It deliberately does **not** use the
+tempting "first-seen before the release date" heuristic: RevenueCat only
+exposes *last-seen* version, not install version or build number, so that would
+wrongly flag loyal users who installed early and updated to the latest build.
 
 ## Install
 

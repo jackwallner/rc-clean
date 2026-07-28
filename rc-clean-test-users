@@ -4,13 +4,16 @@ rc-clean-test-users — remove RevenueCat *test* customers for the current app.
 
 A "test" customer is one we can prove is NOT a real App Store buyer:
   * the app has never been released (any customer must be TestFlight/sim), OR
-  * the customer's last-seen app version was never public on the App Store
-    (a build still in review / prepare, or a phantom TestFlight-only version).
-This pairs RevenueCat's per-customer version with Apple's release states, so it
-stays correct as builds get approved. Anyone with a real (non-sandbox) purchase
-is NEVER touched. The pre-release-timestamp heuristic is deliberately NOT used —
-it would wrongly flag loyal users who installed early and updated to the latest
-build (RevenueCat only exposes last-seen version, not install version).
+  * the customer's last-seen app version was never READY_FOR_SALE — including
+    TestFlight-only marketing versions (from ASC builds) and versions that are
+    submitted but still in review / prepare, OR
+  * they only ever had sandbox purchases (no real App Store purchase).
+This pairs RevenueCat's per-customer version with Apple's App Store versions
+AND TestFlight build inventory, so it stays correct as builds get approved.
+Anyone with a real (non-sandbox) purchase is NEVER touched. The
+pre-release-timestamp heuristic is deliberately NOT used — it would wrongly
+flag loyal users who installed early and updated to the latest build
+(RevenueCat only exposes last-seen version, not install/build number).
 
 Run it from inside an app's repo (auto-detects the app from its bundle id):
     rc-clean-test-users            # dry run: list what WOULD be deleted
@@ -113,6 +116,12 @@ def detect_bundle():
         d = parent
 
 # ---------- App Store Connect ----------
+def canon(v):
+    if not v: return ""
+    parts = [int(x) if x.isdigit() else 0 for x in str(v).split(".")]
+    while len(parts) > 1 and parts[-1] == 0: parts.pop()
+    return ".".join(map(str, parts))
+
 def asc_token():
     env = {}
     for line in open(ASC_CREDS, errors="ignore"):
@@ -120,28 +129,94 @@ def asc_token():
         if m: env[m.group(1)] = m.group(2)
     key = open(os.path.expanduser(os.path.expandvars(env["ASC_KEY_PATH"]))).read()
     now = int(time.time())
-    return jwt.encode({"iss": env["ASC_ISSUER_ID"], "iat": now, "exp": now + 900,
+    return jwt.encode({"iss": env["ASC_ISSUER_ID"], "iat": now, "exp": now + 1200,
                        "aud": "appstoreconnect-v1"}, key, algorithm="ES256",
                       headers={"kid": env["ASC_API_KEY_ID"], "typ": "JWT"})
 
-def released_versions(asc_app_id):
-    """Return set of canonical versionStrings that are currently READY_FOR_SALE."""
-    h = {"Authorization": f"Bearer {asc_token()}"}
-    r = requests.get(f"{ASC}/v1/apps/{asc_app_id}/appStoreVersions"
-                     "?limit=50&fields[appStoreVersions]=versionString,appStoreState", headers=h)
+def _asc_get(path, headers, params=None):
+    r = requests.get(f"{ASC}{path}", headers=headers, params=params or {})
     r.raise_for_status()
-    rel = set()
-    for v in r.json().get("data", []):
-        a = v["attributes"]
-        if a["appStoreState"] == "READY_FOR_SALE":
-            rel.add(canon(a["versionString"]))
-    return rel
+    return r.json()
 
-def canon(v):
-    if not v: return ""
-    parts = [int(x) if x.isdigit() else 0 for x in str(v).split(".")]
-    while len(parts) > 1 and parts[-1] == 0: parts.pop()
-    return ".".join(map(str, parts))
+def asc_inventory(asc_app_id):
+    """Cross App Store submissions with TestFlight builds.
+
+    Returns dict:
+      released:  canon versions currently READY_FOR_SALE
+      pending:   canon versions with a store submission that is NOT live
+                 (WAITING_FOR_REVIEW, PREPARE_FOR_SUBMISSION, …)
+      tf_only:   canon TF marketing versions that were never READY_FOR_SALE
+      store:     list of {version, state, build} for logging
+      tf:        list of {version, builds:[...], max_build} for logging
+    """
+    h = {"Authorization": f"Bearer {asc_token()}"}
+
+    # --- App Store versions + the build attached to each submission ---
+    j = _asc_get(f"/v1/apps/{asc_app_id}/appStoreVersions", h,
+                 {"limit": 50, "include": "build"})
+    by_id = {b["id"]: b["attributes"] for b in j.get("included", [])
+             if b["type"] == "builds"}
+    store, released, pending = [], set(), set()
+    for v in j.get("data", []):
+        a = v["attributes"]
+        ver, state = a.get("versionString") or "", a.get("appStoreState") or ""
+        rel = ((v.get("relationships") or {}).get("build") or {}).get("data") or {}
+        battrs = by_id.get(rel.get("id"), {}) if rel else {}
+        build_num = battrs.get("version")
+        if rel and build_num is None:
+            try:
+                bj = _asc_get(f"/v1/builds/{rel['id']}", h)
+                build_num = bj["data"]["attributes"].get("version")
+            except Exception:
+                pass
+        c = canon(ver)
+        store.append({"version": ver, "canon": c, "state": state, "build": build_num})
+        if state == "READY_FOR_SALE":
+            released.add(c)
+        elif c:
+            pending.add(c)
+
+    # --- TestFlight builds → marketing versions (paginate) ---
+    tf_builds = {}  # canon -> sorted unique build numbers
+    tf_raw = {}     # canon -> example raw version string
+    params = {"filter[app]": asc_app_id, "limit": 50, "sort": "-uploadedDate",
+              "include": "preReleaseVersion"}
+    for _ in range(20):
+        j = _asc_get("/v1/builds", h, params)
+        pr = {x["id"]: x["attributes"].get("version")
+              for x in j.get("included", []) if x["type"] == "preReleaseVersions"}
+        for b in j.get("data", []):
+            a = b["attributes"]
+            prid = (((b.get("relationships") or {}).get("preReleaseVersion") or {})
+                    .get("data") or {})
+            raw = pr.get(prid.get("id"))
+            if not raw:
+                continue
+            c = canon(raw)
+            tf_raw.setdefault(c, raw)
+            try:
+                num = int(a.get("version"))
+            except (TypeError, ValueError):
+                continue
+            tf_builds.setdefault(c, set()).add(num)
+        nxt = (j.get("links") or {}).get("next")
+        if not nxt:
+            break
+        cursor = urllib.parse.parse_qs(
+            urllib.parse.urlparse(nxt).query).get("cursor", [None])[0]
+        if not cursor:
+            break
+        params = {"cursor": cursor}
+
+    tf, tf_only = [], set()
+    for c, nums in sorted(tf_builds.items(), key=lambda kv: kv[0]):
+        tf.append({"version": tf_raw.get(c, c), "canon": c,
+                   "builds": sorted(nums), "max_build": max(nums) if nums else None})
+        if c and c not in released:
+            tf_only.add(c)
+
+    return {"released": released, "pending": pending, "tf_only": tf_only,
+            "store": store, "tf": tf}
 
 # ---------- RevenueCat (dashboard token, self-refreshing) ----------
 class RC_API:
@@ -165,13 +240,28 @@ class RC_API:
         return {"X-Requested-With": "XMLHttpRequest", "Authorization": f"Bearer {self.token}"}
 
     def get(self, path, **kw):
-        return requests.get(f"{RC}{path}", headers=self._h(), **kw)
+        return self._req("get", path, **kw)
 
     def post(self, path, **kw):
-        return requests.post(f"{RC}{path}", headers=self._h(), **kw)
+        return self._req("post", path, **kw)
 
     def delete(self, path):
-        return requests.delete(f"{RC}{path}", headers=self._h())
+        return self._req("delete", path)
+
+    def _req(self, method, path, retries=4, **kw):
+        last = None
+        for attempt in range(retries):
+            try:
+                r = getattr(requests, method)(f"{RC}{path}", headers=self._h(), **kw)
+                if r.status_code in (429, 502, 503, 504) and attempt + 1 < retries:
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                return r
+            except (requests.exceptions.ConnectionError,
+                    requests.exceptions.Timeout) as e:
+                last = e
+                time.sleep(1.5 * (attempt + 1))
+        raise last
 
     # enumerate every customer first-seen in [start,end); recursively split to beat the 100-row cap
     def enumerate_customers(self, pid, start, end, depth=0):
@@ -210,17 +300,62 @@ class RC_API:
         return r.status_code in (200, 202, 204)
 
 # ---------- core ----------
-def clean_app(rc, bundle, do_delete):
+def _has_real_purchase(s):
+    return any(h.get("product") and h.get("is_sandbox") is False
+               for h in s.get("history", []))
+
+def _is_sandbox_only(s):
+    """True if we can prove sandbox activity and no real purchase."""
+    if _has_real_purchase(s):
+        return False
+    if any(h.get("product") and h.get("is_sandbox") is True
+           for h in s.get("history", [])):
+        return True
+    status = s.get("subscription_status") or {}
+    if status.get("sandbox") and not status.get("live"):
+        return True
+    return False
+
+def _log(msg=""):
+    print(msg, flush=True)
+
+def clean_app(rc, bundle, do_delete, since_days=None, created_before=None):
     app = APPS[bundle]
     pid, name = app["rc"], app["name"]
-    released = released_versions(app["asc"])
+    inv = asc_inventory(app["asc"])
+    released, pending, tf_only = inv["released"], inv["pending"], inv["tf_only"]
     never_public = len(released) == 0
-    print(f"\n=== {name}  (RC {pid})  bundle {bundle} ===")
-    print(f"released versions: {sorted(released) if released else 'NONE — app not public'}")
+    # anything not READY_FOR_SALE is test — pending submissions + TF-only builds
+    test_versions = pending | tf_only
 
-    ids = rc.enumerate_customers(pid, "2026-01-01",
-                                 (datetime.date.today() + datetime.timedelta(days=1)).isoformat())
-    print(f"scanning {len(ids)} customers...")
+    end = datetime.date.today() + datetime.timedelta(days=1)
+    if since_days is None:
+        start = datetime.date(2026, 1, 1)
+    else:
+        start = datetime.date.today() - datetime.timedelta(days=since_days)
+
+    _log(f"\n=== {name}  (RC {pid})  bundle {bundle} ===")
+    _log(f"window: {start.isoformat()} → {end.isoformat()}  "
+         f"({'last '+str(since_days)+'d' if since_days is not None else 'YTD'})")
+    _log(f"released (READY_FOR_SALE): {sorted(released) if released else 'NONE — app not public'}")
+    if pending:
+        _log(f"submitted not live:     {sorted(pending)}")
+    if tf_only:
+        _log(f"TF-only versions:       {sorted(tf_only)}")
+    # compact TF vs submitted line for the versions that matter
+    store_by_canon = {s["canon"]: s for s in inv["store"]}
+    for t in inv["tf"]:
+        s = store_by_canon.get(t["canon"])
+        state = s["state"] if s else "NO_STORE_VERSION"
+        sbuild = s.get("build") if s else None
+        flag = ""
+        if t["canon"] not in released:
+            flag = " → TEST"
+        _log(f"  TF {t['version']:8} builds={t['builds'][-4:]} max=#{t['max_build']}  "
+             f"store={state} build=#{sbuild}{flag}")
+
+    ids = rc.enumerate_customers(pid, start.isoformat(), end.isoformat())
+    _log(f"scanning {len(ids)} customers...")
 
     test, kept_purchasers, real = [], 0, 0
     for i, uid in enumerate(ids):
@@ -229,43 +364,63 @@ def clean_app(rc, bundle, do_delete):
             # detail unfetchable (ghost / anonymous $RCAnonymousID record whose
             # GET 404s but is still enumerated and still counts on the chart).
             # If the app was never public it cannot be a real buyer, so it's test.
-            if never_public:
-                test.append((uid, "(no detail)", ""))
+            if never_public or created_before:
+                test.append((uid, "(no detail)", "", "ghost"))
             continue
-        has_real_purchase = any(h.get("product") and h.get("is_sandbox") is False
-                                for h in s.get("history", []))
-        if has_real_purchase:
+        if _has_real_purchase(s):
             kept_purchasers += 1; continue
         ver = s.get("last_seen_app_version")
-        is_test = never_public or (canon(ver) not in released)
-        if is_test:
-            test.append((uid, ver or "(none)", (s.get("created_at") or "")[:10]))
+        c = canon(ver)
+        reason = None
+        created_str = (s.get("created_at") or "")[:10]
+        if never_public:
+            reason = "pre-release"
+        elif created_before and created_str and created_str < created_before:
+            reason = "pre-approval"
+        elif c in test_versions or c not in released:
+            reason = "tf/pending" if c in test_versions else "unknown-ver"
+        elif _is_sandbox_only(s):
+            reason = "sandbox"
+        if reason:
+            test.append((uid, ver or "(none)", created_str, reason))
         else:
             real += 1
-        time.sleep(0.08)
+        if (i + 1) % 25 == 0:
+            _log(f"  … {i+1}/{len(ids)} scanned, {len(test)} test so far")
+        time.sleep(0.03)
 
-    print(f"  real (kept): {real}   purchasers (kept): {kept_purchasers}   TEST: {len(test)}")
+    _log(f"  real (kept): {real}   purchasers (kept): {kept_purchasers}   TEST: {len(test)}")
     from collections import Counter
-    byver = Counter(v for _, v, _ in test)
+    byver = Counter(v for _, v, _, _ in test)
+    byreason = Counter(r for _, _, _, r in test)
     if byver:
-        print("  test by version: " + ", ".join(f"{v}×{n}" for v, n in byver.most_common()))
-    for uid, ver, first in test[:200]:
-        print(f"    {'DELETE' if do_delete else 'would delete'}  {uid[:44]:44}  v{ver:10} first={first}")
+        _log("  test by version: " + ", ".join(f"{v}×{n}" for v, n in byver.most_common()))
+    if byreason:
+        _log("  test by reason:  " + ", ".join(f"{r}×{n}" for r, n in byreason.most_common()))
+    for uid, ver, first, reason in test[:200]:
+        _log(f"    {'DELETE' if do_delete else 'would delete'}  {uid[:44]:44}  "
+             f"v{ver:10} first={first}  ({reason})")
 
     if do_delete and test:
         ok = 0
-        for uid, _, _ in test:
+        for uid, _, _, _ in test:
             if rc.delete_customer(pid, uid): ok += 1
-            time.sleep(0.15)
-        print(f"  deleted {ok}/{len(test)}")
+            time.sleep(0.08)
+        _log(f"  deleted {ok}/{len(test)}")
     elif test:
-        print(f"  (dry run — pass --delete to remove these {len(test)})")
+        _log(f"  (dry run — pass --delete to remove these {len(test)})")
     return len(test)
 
 def main():
     ap = argparse.ArgumentParser(description="Delete RevenueCat test customers for the current app.")
     ap.add_argument("--delete", action="store_true", help="actually delete (default: dry run)")
     ap.add_argument("--all-apps", action="store_true", help="run for every configured app")
+    ap.add_argument("--since-days", type=int, default=None, metavar="N",
+                    help="only customers first-seen in the last N days (default: since 2026-01-01)")
+    ap.add_argument("--created-before", metavar="YYYY-MM-DD", default=None,
+                    help="flag non-purchaser customers created before YYYY-MM-DD as test (e.g. pre-approval TF users)")
+    ap.add_argument("--jobs", type=int, default=1, metavar="N",
+                    help="parallel apps when using --all-apps (default: 1)")
     ap.add_argument("--reseed", metavar="TOKEN", help="store a fresh RevenueCat dashboard token and exit")
     args = ap.parse_args()
 
@@ -278,19 +433,38 @@ def main():
     global APPS
     APPS = load_apps()
 
+    # one shared RC session; each worker uses it (token refresh is serialized enough)
     rc = RC_API()
     if args.all_apps:
+        bundles = list(APPS)
+        jobs = max(1, args.jobs)
+        _log(f"cleaning {len(bundles)} apps  since_days={args.since_days}  created_before={args.created_before}  jobs={jobs}  "
+             f"delete={args.delete}")
         total = 0
-        for bundle in APPS:
-            total += clean_app(rc, bundle, args.delete)
-        print(f"\nTOTAL test customers {'deleted' if args.delete else 'found'}: {total}")
+        if jobs == 1:
+            for bundle in bundles:
+                total += clean_app(rc, bundle, args.delete, args.since_days, args.created_before)
+        else:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            # each thread gets its own RC_API so token refresh / requests don't race
+            def _run(bundle):
+                return clean_app(RC_API(), bundle, args.delete, args.since_days, args.created_before)
+            with ThreadPoolExecutor(max_workers=jobs) as ex:
+                futs = {ex.submit(_run, b): b for b in bundles}
+                for fut in as_completed(futs):
+                    b = futs[fut]
+                    try:
+                        total += fut.result()
+                    except Exception as e:
+                        _log(f"ERROR {APPS[b]['name']}: {e}")
+        _log(f"\nTOTAL test customers {'deleted' if args.delete else 'found'}: {total}")
         return
 
     bundle = detect_bundle()
     if not bundle:
         die("couldn't detect the app from this folder. cd into an app repo, or use --all-apps.\n"
             "known bundles: " + ", ".join(APPS))
-    clean_app(rc, bundle, args.delete)
+    clean_app(rc, bundle, args.delete, args.since_days, args.created_before)
 
 if __name__ == "__main__":
     main()
