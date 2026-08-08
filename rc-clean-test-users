@@ -10,10 +10,8 @@ A "test" customer is one we can prove is NOT a real App Store buyer:
   * they only ever had sandbox purchases (no real App Store purchase).
 This pairs RevenueCat's per-customer version with Apple's App Store versions
 AND TestFlight build inventory, so it stays correct as builds get approved.
-Anyone with a real (non-sandbox) purchase is NEVER touched. The
-pre-release-timestamp heuristic is deliberately NOT used — it would wrongly
-flag loyal users who installed early and updated to the latest build
-(RevenueCat only exposes last-seen version, not install/build number).
+It also clears non-purchasers first seen before the earliest public release.
+Anyone with a real (non-sandbox) purchase is NEVER touched.
 
 Run it from inside an app's repo (auto-detects the app from its bundle id):
     rc-clean-test-users            # dry run: list what WOULD be deleted
@@ -35,6 +33,7 @@ import jwt, requests
 
 RC = "https://app.revenuecat.com"
 ASC = "https://api.appstoreconnect.apple.com"
+ITUNES = "https://itunes.apple.com/lookup"
 def die(msg, code=1):
     print(f"error: {msg}", file=sys.stderr); sys.exit(code)
 
@@ -138,6 +137,17 @@ def _asc_get(path, headers, params=None):
     r.raise_for_status()
     return r.json()
 
+def itunes_release_date(asc_app_id):
+    """Return Apple's public first-release date when the app is listed."""
+    try:
+        r = requests.get(ITUNES, params={"id": asc_app_id, "country": "us"},
+                         timeout=20)
+        r.raise_for_status()
+        row = (r.json().get("results") or [{}])[0]
+        return row.get("releaseDate") or None
+    except (requests.exceptions.RequestException, ValueError, IndexError):
+        return None
+
 def asc_inventory(asc_app_id):
     """Cross App Store submissions with TestFlight builds.
 
@@ -148,6 +158,9 @@ def asc_inventory(asc_app_id):
       tf_only:   canon TF marketing versions that were never READY_FOR_SALE
       store:     list of {version, state, build} for logging
       tf:        list of {version, builds:[...], max_build} for logging
+      public_release_date: Apple's public first-release date, when listed
+      earliest_release_date: earliest ASC releaseDate for a live version
+      earliest_live_upload: fallback release boundary from live build upload
     """
     h = {"Authorization": f"Bearer {asc_token()}"}
 
@@ -156,7 +169,8 @@ def asc_inventory(asc_app_id):
                  {"limit": 50, "include": "build"})
     by_id = {b["id"]: b["attributes"] for b in j.get("included", [])
              if b["type"] == "builds"}
-    store, released, pending, live_uploaded_dates = [], set(), set(), []
+    store, released, pending = [], set(), set()
+    live_release_dates, live_uploaded_dates = [], []
     for v in j.get("data", []):
         a = v["attributes"]
         ver, state = a.get("versionString") or "", a.get("appStoreState") or ""
@@ -171,9 +185,13 @@ def asc_inventory(asc_app_id):
             except Exception:
                 pass
         c = canon(ver)
-        store.append({"version": ver, "canon": c, "state": state, "build": build_num})
+        release_date = a.get("releaseDate")
+        store.append({"version": ver, "canon": c, "state": state,
+                      "build": build_num, "release_date": release_date})
         if state == "READY_FOR_SALE":
             released.add(c)
+            if release_date:
+                live_release_dates.append(release_date)
             up = battrs.get("uploadedDate")
             if up:
                 live_uploaded_dates.append(up)
@@ -219,9 +237,14 @@ def asc_inventory(asc_app_id):
         if c and c not in released:
             tf_only.add(c)
 
+    earliest_release_date = min(live_release_dates) if live_release_dates else None
     earliest_live_upload = min(live_uploaded_dates) if live_uploaded_dates else None
+    public_release_date = itunes_release_date(asc_app_id)
     return {"released": released, "pending": pending, "tf_only": tf_only,
-            "store": store, "tf": tf, "earliest_live_upload": earliest_live_upload}
+            "store": store, "tf": tf,
+            "public_release_date": public_release_date,
+            "earliest_release_date": earliest_release_date,
+            "earliest_live_upload": earliest_live_upload}
 
 # ---------- RevenueCat (dashboard token, self-refreshing) ----------
 class RC_API:
@@ -268,36 +291,57 @@ class RC_API:
                 time.sleep(1.5 * (attempt + 1))
         raise last
 
-    # enumerate every customer first-seen in [start,end); recursively split to beat the 100-row cap
+    # Enumerate every customer first-seen in [start,end) through the current
+    # Audience preview endpoint. Preview returns at most 100 sample rows, so
+    # split date ranges until each response is complete.
     def enumerate_customers(self, pid, start, end, depth=0):
-        spec = {"rule_groups": [{"order": 1, "rule_operator": "AND", "children": [
-            {"field": "first_seen_at", "operator": ">=", "rule_type": "date", "value": start},
-            {"field": "first_seen_at", "operator": "<",  "rule_type": "date", "value": end}]}]}
-        r = self.post(f"/internal/v1/developers/me/subscriber_lists",
-                      json={"app_uuid": pid, "label": "__rcclean_tmp", "list_spec": spec})
-        lid = r.json()["uuid"]
-        rows = []
+        rules = {"groups": [{"conditions": [
+            {"field": "firstSeenAt", "operator": "afterOrOn", "value": start},
+            {"field": "firstSeenAt", "operator": "before", "value": end},
+        ]}]}
+        r = self.post(
+            f"/internal/v1/developers/me/projects/{pid}/audiences/actions/preview",
+            params={"limit": 100}, json={"rules": rules})
+        if r.status_code != 200:
+            raise RuntimeError(
+                f"RevenueCat Audience preview failed for {pid}: "
+                f"HTTP {r.status_code} {r.text[:500]}")
         try:
-            for _ in range(30):
-                j = self.get(f"/internal/v1/developers/me/subscriber_lists/{lid}").json()
-                if j.get("preview_status") == "idle":
-                    rows = j.get("preview_rows", []); break
-                time.sleep(1.2)
-        finally:
-            self.delete(f"/internal/v1/developers/me/subscriber_lists/{lid}")
-        if len(rows) >= 100 and depth < 8:
-            # window too big: split in half by date and recurse
-            ds = datetime.date.fromisoformat(start); de = datetime.date.fromisoformat(end)
-            mid = ds + (de - ds) / 2
-            if mid > ds:
-                return (self.enumerate_customers(pid, start, mid.isoformat(), depth + 1) +
-                        self.enumerate_customers(pid, mid.isoformat(), end, depth + 1))
-        return [r["app_user_id"] for r in rows]
+            j = r.json()
+        except ValueError as e:
+            raise RuntimeError(
+                f"RevenueCat Audience preview returned invalid JSON for {pid}") from e
+        rows = j.get("customer_sample") or []
+        total = (j.get("stats") or {}).get("total_customers")
+        if not isinstance(total, int):
+            raise RuntimeError(
+                f"RevenueCat Audience preview omitted total_customers for {pid}")
+        if total > 100:
+            ds = datetime.date.fromisoformat(start)
+            de = datetime.date.fromisoformat(end)
+            span = (de - ds).days
+            if depth >= 8 or span <= 1:
+                raise RuntimeError(
+                    f"RevenueCat Audience preview has {total} customers in a "
+                    f"single date bucket for {pid}; refusing to truncate results")
+            mid = ds + datetime.timedelta(days=span // 2)
+            left = self.enumerate_customers(pid, start, mid.isoformat(), depth + 1)
+            right = self.enumerate_customers(pid, mid.isoformat(), end, depth + 1)
+            return list(dict.fromkeys(left + right))
+        return list(dict.fromkeys(
+            row["app_user_id"] for row in rows if row.get("app_user_id")))
 
     def customer(self, pid, app_user_id):
         r = self.get(f"/v1/developers/me/projects/{pid}/subscribers/"
                      f"{urllib.parse.quote(app_user_id, safe='')}?sandbox_mode=false")
-        return r.json().get("subscriber") if r.status_code == 200 else None
+        if r.status_code == 404:
+            return None
+        r.raise_for_status()
+        subscriber = r.json().get("subscriber")
+        if not isinstance(subscriber, dict):
+            raise RuntimeError(
+                f"RevenueCat subscriber detail was missing for {pid}/{app_user_id}")
+        return subscriber
 
     def delete_customer(self, pid, app_user_id):
         r = self.delete(f"/v1/developers/me/projects/{pid}/subscribers/"
@@ -330,8 +374,11 @@ def clean_app(rc, bundle, do_delete, since_days=None, created_before=None):
     inv = asc_inventory(app["asc"])
     released, pending, tf_only = inv["released"], inv["pending"], inv["tf_only"]
     never_public = len(released) == 0
+    public_release = inv.get("public_release_date")
+    earliest_release = inv.get("earliest_release_date")
     earliest_live_upload = inv.get("earliest_live_upload")
-    earliest_live_date = earliest_live_upload[:10] if earliest_live_upload else None
+    release_boundary = public_release or earliest_release or earliest_live_upload
+    release_boundary_date = release_boundary[:10] if release_boundary else None
     # anything not READY_FOR_SALE is test — pending submissions + TF-only builds
     test_versions = pending | tf_only
 
@@ -345,8 +392,12 @@ def clean_app(rc, bundle, do_delete, since_days=None, created_before=None):
     _log(f"window: {start.isoformat()} → {end.isoformat()}  "
          f"({'last '+str(since_days)+'d' if since_days is not None else 'YTD'})")
     _log(f"released (READY_FOR_SALE): {sorted(released) if released else 'NONE — app not public'}")
-    if earliest_live_date:
-        _log(f"first live build upload: {earliest_live_upload[:19]}")
+    if public_release:
+        _log(f"first public release:    {public_release[:19]}")
+    elif earliest_release:
+        _log(f"ASC release date:        {earliest_release[:19]}")
+    elif earliest_live_upload:
+        _log(f"release boundary fallback: {earliest_live_upload[:19]}")
     if pending:
         _log(f"submitted not live:     {sorted(pending)}")
     if tf_only:
@@ -366,15 +417,14 @@ def clean_app(rc, bundle, do_delete, since_days=None, created_before=None):
     ids = rc.enumerate_customers(pid, start.isoformat(), end.isoformat())
     _log(f"scanning {len(ids)} customers...")
 
-    test, kept_purchasers, real = [], 0, 0
+    test, stale_ghosts, kept_purchasers, real = [], set(), 0, 0
     for i, uid in enumerate(ids):
         s = rc.customer(pid, uid)
         if not s:
-            # detail unfetchable (ghost / anonymous $RCAnonymousID record whose
-            # GET 404s but is still enumerated and still counts on the chart).
-            # If the app was never public or has an earliest live date, flag as ghost test record.
-            if never_public or created_before or earliest_live_date:
-                test.append((uid, "(no detail)", "", "ghost"))
+            # The Audience preview is live, but a deleted customer can remain
+            # in its sample briefly. A 404 is stale index data, not a delete
+            # candidate.
+            stale_ghosts.add(uid)
             continue
         if _has_real_purchase(s):
             kept_purchasers += 1; continue
@@ -384,7 +434,7 @@ def clean_app(rc, bundle, do_delete, since_days=None, created_before=None):
         created_str = (s.get("created_at") or "")[:10]
         if never_public:
             reason = "pre-release"
-        elif earliest_live_date and created_str and created_str < earliest_live_date:
+        elif release_boundary_date and created_str and created_str < release_boundary_date:
             reason = "pre-release"
         elif created_before and created_str and created_str < created_before:
             reason = "pre-approval"
@@ -400,6 +450,8 @@ def clean_app(rc, bundle, do_delete, since_days=None, created_before=None):
             _log(f"  … {i+1}/{len(ids)} scanned, {len(test)} test so far")
         time.sleep(0.03)
 
+    if stale_ghosts:
+        _log(f"  stale/absent rows skipped: {len(stale_ghosts)}")
     _log(f"  real (kept): {real}   purchasers (kept): {kept_purchasers}   TEST: {len(test)}")
     from collections import Counter
     byver = Counter(v for _, v, _, _ in test)

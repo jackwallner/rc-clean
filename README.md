@@ -17,13 +17,13 @@ Apple's App Store submissions **and** TestFlight build inventory:
   TF-only marketing versions (from ASC builds) and versions still in review /
   prepare → test.
 - Sandbox-only purchasers (no real App Store purchase) → test.
+- Non-purchasers first seen before the earliest public release → test.
 - **Anyone with a real (non-sandbox) purchase is never deleted**, full stop.
 
 Because it re-checks Apple's live release states and TF builds on every run, it
-self-corrects as builds get approved. It deliberately does **not** use the
-tempting "first-seen before the release date" heuristic: RevenueCat only
-exposes *last-seen* version, not install version or build number, so that would
-wrongly flag loyal users who installed early and updated to the latest build.
+self-corrects as builds get approved. It uses Apple's public first-release date
+when available, then App Store Connect's `releaseDate`, and finally the
+earliest live build upload when the date fields are empty.
 
 ## Install
 
@@ -122,8 +122,8 @@ scanning 12 customers...
 - RevenueCat deletion is asynchronous; a deleted customer 404s within minutes
   but may still appear in the enumeration index briefly. Re-running is safe and
   idempotent.
-- Ghost/anonymous records whose detail endpoint 404s are treated as test **only**
-  when the app is pre-release (they cannot be real buyers of an unreleased app).
+- Ghost/anonymous rows whose detail endpoint 404s are reported as stale and
+  skipped. They are already absent from the customer detail endpoint.
 
 ## License
 
