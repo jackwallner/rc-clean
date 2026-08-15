@@ -1,4 +1,14 @@
 {
-  "com.example.myapp":    {"rc": "<revenuecat-project-id>", "asc": "<app-store-connect-app-id>", "name": "My App"},
-  "com.example.otherapp": {"rc": "<revenuecat-project-id>", "asc": "<app-store-connect-app-id>", "name": "Other App"}
+  "com.example.myapp": {
+    "rc": "<revenuecat-project-id>",
+    "asc": "<app-store-connect-app-id>",
+    "name": "My App",
+    "allow_versions": []
+  },
+  "com.example.otherapp": {
+    "rc": "<revenuecat-project-id>",
+    "asc": "<app-store-connect-app-id>",
+    "name": "Other App",
+    "allow_versions": []
+  }
 }

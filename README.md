@@ -47,7 +47,8 @@ cp apps.example.json ~/.rc-clean/apps.json
   "com.you.app": {
     "rc":   "<revenuecat-project-id>",
     "asc":  "<app-store-connect-app-id>",
-    "name": "Your App"
+    "name": "Your App",
+    "allow_versions": []
   }
 }
 ```
@@ -57,6 +58,10 @@ id is the numeric id in your App Store Connect app URL. `rc-clean` auto-detects
 which app you mean by walking up from the current directory to the nearest
 `project.yml` / Xcode project and matching its bundle id — so just run it from
 inside an app repo.
+
+`allow_versions` is an optional list of marketing versions to keep regardless
+of App Store or TestFlight status. Values are canonicalized, so `1.3.0` and
+`1.3` match the same version. Use it only for deliberate per-app exceptions.
 
 **2. App Store Connect API key** — a shell-style file at
 `~/.rc-clean/asc_credentials` exporting an App Store Connect API key with app

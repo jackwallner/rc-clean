@@ -371,6 +371,7 @@ def _log(msg=""):
 def clean_app(rc, bundle, do_delete, since_days=None, created_before=None):
     app = APPS[bundle]
     pid, name = app["rc"], app["name"]
+    allow_versions = {canon(v) for v in app.get("allow_versions", []) if canon(v)}
     inv = asc_inventory(app["asc"])
     released, pending, tf_only = inv["released"], inv["pending"], inv["tf_only"]
     never_public = len(released) == 0
@@ -402,6 +403,8 @@ def clean_app(rc, bundle, do_delete, since_days=None, created_before=None):
         _log(f"submitted not live:     {sorted(pending)}")
     if tf_only:
         _log(f"TF-only versions:       {sorted(tf_only)}")
+    if allow_versions:
+        _log(f"allowlisted versions:   {sorted(allow_versions)}")
     # compact TF vs submitted line for the versions that matter
     store_by_canon = {s["canon"]: s for s in inv["store"]}
     for t in inv["tf"]:
@@ -417,7 +420,7 @@ def clean_app(rc, bundle, do_delete, since_days=None, created_before=None):
     ids = rc.enumerate_customers(pid, start.isoformat(), end.isoformat())
     _log(f"scanning {len(ids)} customers...")
 
-    test, stale_ghosts, kept_purchasers, real = [], set(), 0, 0
+    test, stale_ghosts, kept_purchasers, real, allowlisted = [], set(), 0, 0, 0
     for i, uid in enumerate(ids):
         s = rc.customer(pid, uid)
         if not s:
@@ -430,6 +433,9 @@ def clean_app(rc, bundle, do_delete, since_days=None, created_before=None):
             kept_purchasers += 1; continue
         ver = s.get("last_seen_app_version")
         c = canon(ver)
+        if c in allow_versions:
+            allowlisted += 1
+            continue
         reason = None
         created_str = (s.get("created_at") or "")[:10]
         if never_public:
@@ -452,7 +458,8 @@ def clean_app(rc, bundle, do_delete, since_days=None, created_before=None):
 
     if stale_ghosts:
         _log(f"  stale/absent rows skipped: {len(stale_ghosts)}")
-    _log(f"  real (kept): {real}   purchasers (kept): {kept_purchasers}   TEST: {len(test)}")
+    _log(f"  real (kept): {real}   purchasers (kept): {kept_purchasers}   "
+         f"allowlisted (kept): {allowlisted}   TEST: {len(test)}")
     from collections import Counter
     byver = Counter(v for _, v, _, _ in test)
     byreason = Counter(r for _, _, _, r in test)
