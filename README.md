@@ -21,7 +21,11 @@ published test track, sandbox-only customers, or non-purchasers selected by an
 explicit `--created-before` cutoff are candidates. Unknown Android versions are
 kept. Play release names in `versionName` or `versionName (versionCode)` form
 are matched to RevenueCat's app version. To clean a pre-release cohort after
-launch, use `--created-before` with a cutoff after that cohort.
+launch, use `--created-before` with a cutoff after that cohort. If a test-track
+lookup is unavailable after production launch, versions from that track are
+treated as unknown and kept. `--assume-unreleased` skips Play reads for a single
+Android app run when its unreleased state is already confirmed. It requires
+`--platform android` and does not persist in the app config.
 
 **Anyone with a real purchase is always kept.**
 
@@ -117,6 +121,7 @@ cd ~/my-app-repo
 ./rc-clean-test-users                         # dry run for configured platforms
 ./rc-clean-test-users --platform android      # Android only
 ./rc-clean-test-users --platform android --delete
+./rc-clean-test-users --platform android --assume-unreleased --delete
 ./rc-clean-test-users --delete                # delete candidates for this app
 ./rc-clean-test-users --all-apps              # all configured apps/platforms
 ./rc-clean-test-users --all-apps --platform android
