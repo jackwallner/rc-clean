@@ -1,39 +1,44 @@
 #!/usr/bin/env python3
 """
-rc-clean-test-users — remove RevenueCat *test* customers for the current app.
+rc-clean-test-users removes RevenueCat test customers for configured apps.
 
-A "test" customer is one we can prove is NOT a real App Store buyer:
-  * the app has never been released (any customer must be TestFlight/sim), OR
-  * the customer's last-seen app version was never READY_FOR_SALE — including
-    TestFlight-only marketing versions (from ASC builds) and versions that are
-    submitted but still in review / prepare, OR
-  * they only ever had sandbox purchases (no real App Store purchase).
-This pairs RevenueCat's per-customer version with Apple's App Store versions
-AND TestFlight build inventory, so it stays correct as builds get approved.
-It also clears non-purchasers first seen before the earliest public release.
-Anyone with a real (non-sandbox) purchase is NEVER touched.
+For iOS, it checks App Store and TestFlight releases. For Android, it checks
+Google Play production and configured test tracks. An app with no published
+production release is treated as pre-release. After production launch, an
+Android customer is only classified from a version that appears on a published
+test track, a sandbox-only purchase, or an explicit --created-before cutoff.
+Unknown Android versions are kept. Any real purchase is always kept.
 
 Run it from inside an app's repo (auto-detects the app from its bundle id):
-    rc-clean-test-users            # dry run: list what WOULD be deleted
-    rc-clean-test-users --delete   # actually delete
-    rc-clean-test-users --all-apps # every configured app (dry run unless --delete)
+    rc-clean-test-users                    # dry run for configured platforms
+    rc-clean-test-users --platform android # Android only
+    rc-clean-test-users --delete            # actually delete candidates
+    rc-clean-test-users --all-apps          # every configured app/platform
 
 Auth:
   * App Store Connect: ~/.baseball_credentials (ASC_API_KEY_ID/ISSUER_ID/KEY_PATH)
+  * Google Play: a local service-account JSON with Android Publisher API access
   * RevenueCat: ~/.revenuecat/auth_token (a dashboard token; self-refreshes).
-    If it ever expires, log in at app.revenuecat.com and reseed with:
-      rc-clean-test-users --reseed <authentication_token>
-    (get the token from the dashboard: DevTools > run
-     fetch('/v1/developers/login/refresh-token',{method:'POST',
-     headers:{'X-Requested-With':'XMLHttpRequest'},credentials:'include'})
-     .then(r=>r.json()).then(d=>copy(d.authentication_token)) )
 """
-import os, sys, re, json, time, argparse, datetime, subprocess, urllib.parse
-import jwt, requests
+import argparse
+import datetime
+import json
+import os
+import re
+import sys
+import time
+import urllib.parse
+from collections import Counter
+
+import jwt
+import requests
 
 RC = "https://app.revenuecat.com"
 ASC = "https://api.appstoreconnect.apple.com"
 ITUNES = "https://itunes.apple.com/lookup"
+GOOGLE_PLAY = "https://androidpublisher.googleapis.com/androidpublisher/v3"
+GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+GOOGLE_PLAY_SCOPE = "https://www.googleapis.com/auth/androidpublisher"
 HTTP_TIMEOUT = (10, 60)
 def die(msg, code=1):
     print(f"error: {msg}", file=sys.stderr); sys.exit(code)
@@ -105,7 +110,8 @@ def detect_bundle():
                     os.path.exists(os.path.join(dirpath, x, m))
                     for m in ("project.yml", "Project.yml"))]
                 for f in files:
-                    if f.endswith((".pbxproj", "Info.plist")):
+                    if f.endswith((".pbxproj", "Info.plist", "build.gradle",
+                                   "build.gradle.kts", "AndroidManifest.xml")):
                         try: text += open(os.path.join(dirpath, f), errors="ignore").read()
                         except Exception: pass
             b = _match_bundle(text)
@@ -248,6 +254,149 @@ def asc_inventory(asc_app_id):
             "earliest_release_date": earliest_release_date,
             "earliest_live_upload": earliest_live_upload}
 
+# ---------- Google Play ----------
+class GooglePlayAPI:
+    def __init__(self, credentials_path):
+        path = os.path.expanduser(os.path.expandvars(credentials_path or ""))
+        if not path or not os.path.isfile(path):
+            raise RuntimeError(
+                "Google Play service-account JSON is missing. Set "
+                "RC_CLEAN_GOOGLE_PLAY_CREDS or android.google_play_credentials "
+                "in ~/.rc-clean/apps.json")
+        try:
+            with open(path) as f:
+                self.credentials = json.load(f)
+        except (OSError, ValueError) as e:
+            raise RuntimeError("could not read Google Play service-account JSON") from e
+        if (self.credentials.get("type") != "service_account" or
+                not self.credentials.get("client_email") or
+                not self.credentials.get("private_key")):
+            raise RuntimeError("Google Play credentials must be a service-account JSON file")
+        self.access_token = None
+        self.expires_at = 0
+
+    def _token(self):
+        now = int(time.time())
+        if self.access_token and self.expires_at - 60 > now:
+            return self.access_token
+        token_url = self.credentials.get("token_uri") or GOOGLE_TOKEN_URL
+        assertion = jwt.encode(
+            {"iss": self.credentials["client_email"],
+             "scope": GOOGLE_PLAY_SCOPE,
+             "aud": token_url,
+             "iat": now,
+             "exp": now + 3600},
+            self.credentials["private_key"],
+            algorithm="RS256")
+        try:
+            response = requests.post(
+                token_url,
+                data={"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+                      "assertion": assertion},
+                timeout=HTTP_TIMEOUT)
+        except requests.exceptions.RequestException as e:
+            raise RuntimeError("Google OAuth token request failed") from e
+        if response.status_code != 200:
+            try:
+                details = response.json()
+                error = details.get("error_description") or details.get("error") or ""
+            except ValueError:
+                error = ""
+            raise RuntimeError(
+                f"Google OAuth token request failed: HTTP {response.status_code} {error}")
+        try:
+            data = response.json()
+            self.access_token = data["access_token"]
+            self.expires_at = now + int(data.get("expires_in", 3600))
+        except (KeyError, TypeError, ValueError) as e:
+            raise RuntimeError("Google OAuth response omitted an access token") from e
+        return self.access_token
+
+    def track_releases(self, package_name, track):
+        package = urllib.parse.quote(package_name, safe="")
+        track_id = urllib.parse.quote(track, safe="")
+        url = f"{GOOGLE_PLAY}/applications/{package}/tracks/{track_id}/releases"
+        try:
+            response = requests.get(
+                url,
+                headers={"Authorization": f"Bearer {self._token()}",
+                         "Accept": "application/json"},
+                timeout=HTTP_TIMEOUT)
+        except requests.exceptions.RequestException as e:
+            raise RuntimeError(f"Google Play request failed for track {track}") from e
+        if response.status_code == 204 or response.status_code == 404:
+            return None if response.status_code == 404 else []
+        if response.status_code != 200:
+            try:
+                message = response.json().get("error", {}).get("message", "")
+            except ValueError:
+                message = ""
+            raise RuntimeError(
+                f"Google Play track read failed for {track}: "
+                f"HTTP {response.status_code} {message}")
+        try:
+            releases = response.json().get("releases", [])
+        except ValueError as e:
+            raise RuntimeError(f"Google Play returned invalid JSON for track {track}") from e
+        if not isinstance(releases, list):
+            raise RuntimeError(f"Google Play returned an invalid release list for track {track}")
+        return releases
+
+def play_version(release_name):
+    """Extract a versionName from Play's default 'versionName (versionCode)' name."""
+    if not release_name:
+        return ""
+    match = re.fullmatch(r"\s*(\d+(?:\.\d+)*)(?:\s+\(\d+\))?\s*", str(release_name))
+    return canon(match.group(1)) if match else ""
+
+def android_inventory(android):
+    credentials_path = (os.environ.get("RC_CLEAN_GOOGLE_PLAY_CREDS") or
+                        android.get("google_play_credentials") or
+                        os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"))
+    api = GooglePlayAPI(credentials_path)
+    package_name = android["package_name"]
+    production = api.track_releases(package_name, "production")
+    production_found = production is not None
+    if production is None:
+        production = []
+    test_tracks = android.get("test_tracks", ["internal", "alpha", "beta"])
+    if not isinstance(test_tracks, list) or any(not isinstance(t, str) or not t for t in test_tracks):
+        raise RuntimeError("android.test_tracks must be a list of Google Play track names")
+    test_tracks = list(dict.fromkeys(test_tracks))
+    if "production" in test_tracks:
+        raise RuntimeError("android.test_tracks must not include production")
+
+    published_production = [
+        release for release in production
+        if release.get("releaseLifecycleState") == "RELEASE_LIFECYCLE_STATE_PUBLISHED"]
+    released = {version for release in published_production
+                if (version := play_version(release.get("releaseName")))}
+    test_versions = set()
+    tracks = {}
+    verified = production_found
+    for track in test_tracks:
+        releases = api.track_releases(package_name, track)
+        if releases is None:
+            tracks[track] = []
+            continue
+        verified = True
+        active = [
+            release for release in releases
+            if release.get("releaseLifecycleState") == "RELEASE_LIFECYCLE_STATE_PUBLISHED"]
+        tracks[track] = active
+        test_versions.update(
+            version for release in active
+            if (version := play_version(release.get("releaseName"))))
+    if not verified:
+        raise RuntimeError(
+            f"Google Play could not verify package {package_name}; "
+            "no production or configured test tracks were found")
+    return {"has_public_release": bool(published_production),
+            "released": released,
+            "test_versions": test_versions,
+            "production": production,
+            "test_tracks": tracks}
+
 # ---------- RevenueCat (dashboard token, self-refreshing) ----------
 class RC_API:
     def __init__(self):
@@ -343,7 +492,7 @@ class RC_API:
         subscriber = r.json().get("subscriber")
         if not isinstance(subscriber, dict):
             raise RuntimeError(
-                f"RevenueCat subscriber detail was missing for {pid}/{app_user_id}")
+                f"RevenueCat subscriber detail was missing for project {pid}")
         return subscriber
 
     def delete_customer(self, pid, app_user_id):
@@ -371,9 +520,24 @@ def _is_sandbox_only(s):
 def _log(msg=""):
     print(msg, flush=True)
 
+def ios_config(app):
+    nested = app.get("ios")
+    config = nested if isinstance(nested, dict) else app
+    return config if config.get("rc") and config.get("asc") else None
+
+def android_config(app):
+    config = app.get("android")
+    if not isinstance(config, dict):
+        return None
+    return config if config.get("rc") and config.get("package_name") else None
+
 def clean_app(rc, bundle, do_delete, since_days=None, created_before=None):
-    app = APPS[bundle]
-    pid, name = app["rc"], app["name"]
+    root_app = APPS[bundle]
+    app = ios_config(root_app)
+    if not app:
+        raise RuntimeError(f"{bundle} has no iOS RevenueCat and App Store Connect config")
+    pid = app["rc"]
+    name = app.get("name") or root_app.get("name") or bundle
     allow_versions = {canon(v) for v in app.get("allow_versions", []) if canon(v)}
     inv = asc_inventory(app["asc"])
     released, pending, tf_only = inv["released"], inv["pending"], inv["tf_only"]
@@ -463,7 +627,6 @@ def clean_app(rc, bundle, do_delete, since_days=None, created_before=None):
         _log(f"  stale/absent rows skipped: {len(stale_ghosts)}")
     _log(f"  real (kept): {real}   purchasers (kept): {kept_purchasers}   "
          f"allowlisted (kept): {allowlisted}   TEST: {len(test)}")
-    from collections import Counter
     byver = Counter(v for _, v, _, _ in test)
     byreason = Counter(r for _, _, _, r in test)
     if byver:
@@ -484,10 +647,141 @@ def clean_app(rc, bundle, do_delete, since_days=None, created_before=None):
         _log(f"  (dry run — pass --delete to remove these {len(test)})")
     return len(test)
 
+def clean_android_app(rc, bundle, do_delete, since_days=None, created_before=None):
+    root_app = APPS[bundle]
+    android = android_config(root_app)
+    if not android:
+        raise RuntimeError(f"{bundle} has no Android RevenueCat and Google Play config")
+    pid = android["rc"]
+    name = android.get("name") or f"{root_app.get('name') or bundle} Android"
+    package_name = android["package_name"]
+    allow_versions = {canon(v) for v in
+                      android.get("allow_versions", root_app.get("allow_versions", []))
+                      if canon(v)}
+    inv = android_inventory(android)
+
+    end = datetime.date.today() + datetime.timedelta(days=1)
+    if since_days is None:
+        start = datetime.date(2026, 1, 1)
+    else:
+        start = datetime.date.today() - datetime.timedelta(days=since_days)
+
+    _log(f"\n=== {name}  (RC {pid})  package {package_name} ===")
+    _log(f"window: {start.isoformat()} to {end.isoformat()}  "
+         f"({'last '+str(since_days)+'d' if since_days is not None else 'YTD'})")
+    _log(f"published production versions: "
+         f"{sorted(inv['released']) if inv['released'] else 'NONE'}")
+    if not inv["has_public_release"]:
+        _log("production release is not published")
+    pending_production = [
+        release for release in inv["production"]
+        if release.get("releaseLifecycleState") != "RELEASE_LIFECYCLE_STATE_PUBLISHED"]
+    if pending_production:
+        pending = [f"{release.get('releaseName') or '(unnamed)'} "
+                   f"({release.get('releaseLifecycleState') or 'unknown'})"
+                   for release in pending_production]
+        _log("production releases not published: " + ", ".join(pending))
+    track_versions = {
+        track: sorted({version for release in releases
+                       if (version := play_version(release.get("releaseName")))})
+        for track, releases in inv["test_tracks"].items() if releases
+    }
+    if track_versions:
+        _log("published test-track versions: " + "; ".join(
+            f"{track}={versions}" for track, versions in track_versions.items()))
+    if allow_versions:
+        _log(f"allowlisted versions: {sorted(allow_versions)}")
+
+    ids = rc.enumerate_customers(pid, start.isoformat(), end.isoformat())
+    _log(f"scanning {len(ids)} customers...")
+
+    test, stale_ghosts = [], 0
+    kept_purchasers = kept_released = allowlisted = unknown = 0
+    for i, uid in enumerate(ids):
+        subscriber = rc.customer(pid, uid)
+        if not subscriber:
+            # Audience preview can briefly retain an already-absent customer.
+            stale_ghosts += 1
+            continue
+        if _has_real_purchase(subscriber):
+            kept_purchasers += 1
+            continue
+
+        version = subscriber.get("last_seen_app_version")
+        normalized = canon(version)
+        if normalized in allow_versions:
+            allowlisted += 1
+            continue
+
+        created = (subscriber.get("created_at") or "")[:10]
+        reason = None
+        if not inv["has_public_release"]:
+            reason = "pre-release"
+        elif created_before and created and created < created_before:
+            reason = "pre-approval"
+        elif normalized in inv["test_versions"] - inv["released"]:
+            reason = "play-test-track"
+        elif _is_sandbox_only(subscriber):
+            reason = "sandbox"
+        elif normalized in inv["released"]:
+            kept_released += 1
+        else:
+            unknown += 1
+
+        if reason:
+            test.append((uid, version or "(none)", created, reason))
+        if (i + 1) % 25 == 0:
+            _log(f"  ... {i+1}/{len(ids)} scanned, {len(test)} test so far")
+        time.sleep(0.03)
+
+    if stale_ghosts:
+        _log(f"  stale/absent rows skipped: {stale_ghosts}")
+    _log(f"  purchasers (kept): {kept_purchasers}   released-version (kept): "
+         f"{kept_released}   allowlisted (kept): {allowlisted}   "
+         f"unknown-version (kept): {unknown}   TEST: {len(test)}")
+    byver = Counter(version for _, version, _, _ in test)
+    byreason = Counter(reason for _, _, _, reason in test)
+    if byver:
+        _log("  test by version: " + ", ".join(
+            f"{version}x{count}" for version, count in byver.most_common()))
+    if byreason:
+        _log("  test by reason:  " + ", ".join(
+            f"{reason}x{count}" for reason, count in byreason.most_common()))
+    for _, version, first, reason in test[:200]:
+        _log(f"    {'DELETE' if do_delete else 'would delete'}  "
+             f"v{version:10} first={first}  ({reason})")
+
+    if do_delete and test:
+        deleted = 0
+        for app_user_id, _, _, _ in test:
+            if rc.delete_customer(pid, app_user_id):
+                deleted += 1
+            time.sleep(0.08)
+        _log(f"  deleted {deleted}/{len(test)}")
+        if deleted != len(test):
+            raise RuntimeError(f"RevenueCat rejected {len(test) - deleted} customer deletions")
+    elif test:
+        _log(f"  (dry run; pass --delete to remove these {len(test)})")
+    return len(test)
+
+def clean_bundle(rc, bundle, do_delete, since_days=None, created_before=None,
+                 platform="all"):
+    root_app = APPS[bundle]
+    selected = ("ios", "android") if platform == "all" else (platform,)
+    total = 0
+    for target in selected:
+        if target == "ios" and ios_config(root_app):
+            total += clean_app(rc, bundle, do_delete, since_days, created_before)
+        elif target == "android" and android_config(root_app):
+            total += clean_android_app(rc, bundle, do_delete, since_days, created_before)
+    return total
+
 def main():
     ap = argparse.ArgumentParser(description="Delete RevenueCat test customers for the current app.")
     ap.add_argument("--delete", action="store_true", help="actually delete (default: dry run)")
     ap.add_argument("--all-apps", action="store_true", help="run for every configured app")
+    ap.add_argument("--platform", choices=("all", "ios", "android"), default="all",
+                    help="platforms to scan (default: all configured platforms)")
     ap.add_argument("--since-days", type=int, default=None, metavar="N",
                     help="only customers first-seen in the last N days (default: since 2026-01-01)")
     ap.add_argument("--created-before", metavar="YYYY-MM-DD", default=None,
@@ -512,24 +806,34 @@ def main():
     # one shared RC session; each worker uses it (token refresh is serialized enough)
     rc = RC_API()
     if args.all_apps:
-        bundles = list(APPS)
+        bundles = [bundle for bundle, app in APPS.items()
+                   if args.platform == "all" or
+                   (args.platform == "ios" and ios_config(app)) or
+                   (args.platform == "android" and android_config(app))]
+        if not bundles:
+            die(f"no apps configured for platform {args.platform}")
         jobs = max(1, args.jobs)
-        _log(f"cleaning {len(bundles)} apps  since_days={args.since_days}  created_before={args.created_before}  jobs={jobs}  "
-             f"delete={args.delete}")
+        _log(f"cleaning {len(bundles)} apps on {args.platform}  "
+             f"since_days={args.since_days}  created_before={args.created_before}  "
+             f"jobs={jobs}  delete={args.delete}")
         total = 0
         errors = []
         if jobs == 1:
             for bundle in bundles:
                 try:
-                    total += clean_app(rc, bundle, args.delete, args.since_days, args.created_before)
+                    total += clean_bundle(
+                        rc, bundle, args.delete, args.since_days,
+                        args.created_before, args.platform)
                 except Exception as e:
                     errors.append((bundle, e))
-                    _log(f"ERROR {APPS[bundle]['name']}: {e}")
+                    _log(f"ERROR {APPS[bundle].get('name') or bundle}: {e}")
         else:
             from concurrent.futures import ThreadPoolExecutor, as_completed
             # each thread gets its own RC_API so token refresh / requests don't race
             def _run(bundle):
-                return clean_app(RC_API(), bundle, args.delete, args.since_days, args.created_before)
+                return clean_bundle(
+                    RC_API(), bundle, args.delete, args.since_days,
+                    args.created_before, args.platform)
             with ThreadPoolExecutor(max_workers=jobs) as ex:
                 futs = {ex.submit(_run, b): b for b in bundles}
                 for fut in as_completed(futs):
@@ -538,7 +842,7 @@ def main():
                         total += fut.result()
                     except Exception as e:
                         errors.append((b, e))
-                        _log(f"ERROR {APPS[b]['name']}: {e}")
+                        _log(f"ERROR {APPS[b].get('name') or b}: {e}")
         _log(f"\nTOTAL test customers {'deleted' if args.delete else 'found'}: {total}")
         if errors:
             _log(f"FAILED apps: {len(errors)}/{len(bundles)}")
@@ -549,7 +853,15 @@ def main():
     if not bundle:
         die("couldn't detect the app from this folder. cd into an app repo, or use --all-apps.\n"
             "known bundles: " + ", ".join(APPS))
-    clean_app(rc, bundle, args.delete, args.since_days, args.created_before)
+    if args.platform == "ios" and not ios_config(APPS[bundle]):
+        die(f"{bundle} has no iOS configuration")
+    if args.platform == "android" and not android_config(APPS[bundle]):
+        die(f"{bundle} has no Android configuration")
+    try:
+        clean_bundle(rc, bundle, args.delete, args.since_days,
+                     args.created_before, args.platform)
+    except Exception as e:
+        die(f"{APPS[bundle].get('name') or bundle}: {e}")
     return 0
 
 if __name__ == "__main__":

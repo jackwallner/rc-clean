@@ -1,29 +1,29 @@
 # rc-clean
 
-A small CLI that removes **test / TestFlight / simulator** customers from your
-[RevenueCat](https://www.revenuecat.com/) projects without ever touching a real
-paying user. Sandbox and TestFlight builds create anonymous RevenueCat customers
-that pollute your New-Customer charts and cohort analytics; this tool finds and
-deletes exactly those, and leaves everyone else alone.
+A CLI that removes test customers from configured [RevenueCat](https://www.revenuecat.com/)
+projects. It checks App Store and TestFlight releases for iOS, and Google Play
+production and test tracks for Android. Real purchasers are always kept.
 
-## The one rule it trusts
+## Classification rules
 
-A customer is **test** only if you can *prove* they are not a real App Store
-buyer. `rc-clean` pairs each RevenueCat customer's last-seen app version against
-Apple's App Store submissions **and** TestFlight build inventory:
+A customer is classified as test only when purchase and release data support
+that decision.
 
-- The app has **never been released** → any customer must be TestFlight/sim.
-- The customer's last-seen version was **never `READY_FOR_SALE`** — including
-  TF-only marketing versions (from ASC builds) and versions still in review /
-  prepare → test.
-- Sandbox-only purchasers (no real App Store purchase) → test.
-- Non-purchasers first seen before the earliest public release → test.
-- **Anyone with a real (non-sandbox) purchase is never deleted**, full stop.
+For iOS, `rc-clean` compares RevenueCat app versions against App Store
+submissions and TestFlight builds. Apps without a public release, pending
+versions, TestFlight-only versions, sandbox-only purchases, and customers first
+seen before the first public release are candidates.
 
-Because it re-checks Apple's live release states and TF builds on every run, it
-self-corrects as builds get approved. It uses Apple's public first-release date
-when available, then App Store Connect's `releaseDate`, and finally the
-earliest live build upload when the date fields are empty.
+For Android, it reads the Google Play production track and configured test
+tracks. If there is no published production release, non-purchasers are
+pre-release candidates. After production launch, only versions found on a
+published test track, sandbox-only customers, or non-purchasers selected by an
+explicit `--created-before` cutoff are candidates. Unknown Android versions are
+kept. Play release names in `versionName` or `versionName (versionCode)` form
+are matched to RevenueCat's app version. To clean a pre-release cohort after
+launch, use `--created-before` with a cutoff after that cohort.
+
+**Anyone with a real purchase is always kept.**
 
 ## Install
 
@@ -35,7 +35,7 @@ pip install pyjwt requests
 
 ## Configure
 
-**1. Your app map** — copy the example and fill in your projects:
+**1. Your app map**: copy the example and fill in your projects.
 
 ```bash
 mkdir -p ~/.rc-clean
@@ -45,27 +45,39 @@ cp apps.example.json ~/.rc-clean/apps.json
 ```json
 {
   "com.you.app": {
-    "rc":   "<revenuecat-project-id>",
-    "asc":  "<app-store-connect-app-id>",
     "name": "Your App",
-    "allow_versions": []
+    "rc": "<ios-revenuecat-project-id>",
+    "asc": "<app-store-connect-app-id>",
+    "allow_versions": [],
+    "android": {
+      "name": "Your App Android",
+      "rc": "<android-revenuecat-project-id>",
+      "package_name": "com.you.app",
+      "google_play_credentials": "~/.config/google-play/service-account.json",
+      "test_tracks": ["internal", "alpha", "beta"],
+      "allow_versions": []
+    }
   }
 }
 ```
 
-The RevenueCat project id is the short hash in your dashboard URL; the ASC app
-id is the numeric id in your App Store Connect app URL. `rc-clean` auto-detects
-which app you mean by walking up from the current directory to the nearest
-`project.yml` / Xcode project and matching its bundle id — so just run it from
-inside an app repo.
+Keep the existing top-level `rc` and `asc` fields for iOS. The nested
+`android` object is optional. Android-only apps can omit the top-level `rc` and
+`asc` fields. RevenueCat project ids are the short hashes in their dashboard
+URLs. `package_name` must match the package in Google Play Console.
 
-`allow_versions` is an optional list of marketing versions to keep regardless
-of App Store or TestFlight status. Values are canonicalized, so `1.3.0` and
-`1.3` match the same version. Use it only for deliberate per-app exceptions.
+`rc-clean` auto-detects the app by walking up to the nearest `project.yml`,
+Xcode project, or Android Gradle project and matching its bundle id or package
+name. Run it inside the app repo.
 
-**2. App Store Connect API key** — a shell-style file at
+`allow_versions` is an optional list of app versions to always keep. Values are
+canonicalized, so `1.3.0` and `1.3` match the same version. Android can use its
+own nested `allow_versions` list. Add custom Google Play test track names to
+`test_tracks`; the default list is `internal`, `alpha`, and `beta`.
+
+**2. App Store Connect API key**: a shell-style file at
 `~/.rc-clean/asc_credentials` exporting an App Store Connect API key with app
-access:
+access.
 
 ```bash
 export ASC_API_KEY_ID="XXXXXXXXXX"
@@ -73,9 +85,15 @@ export ASC_ISSUER_ID="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
 export ASC_KEY_PATH="$HOME/.appstoreconnect/AuthKey_XXXXXXXXXX.p8"
 ```
 
-**3. RevenueCat auth** — the tool uses a RevenueCat dashboard session token
-(the public REST API can't list or delete customers). Log in at
-[app.revenuecat.com](https://app.revenuecat.com), open DevTools, and run:
+**3. Google Play API access**: configure a local service-account JSON that
+already has Android Publisher API access to the app. Keep it outside the repo,
+then set `google_play_credentials` in that app's `android` config, or set
+`RC_CLEAN_GOOGLE_PLAY_CREDS` to use one file for every Android app. The tool
+uses the read-only Play production and track release list endpoints.
+
+**4. RevenueCat auth**: the tool uses a RevenueCat dashboard session token.
+Log in at [app.revenuecat.com](https://app.revenuecat.com), open DevTools, and
+run:
 
 ```js
 fetch('/v1/developers/login/refresh-token', {
@@ -85,8 +103,8 @@ fetch('/v1/developers/login/refresh-token', {
 }).then(r => r.json()).then(d => copy(d.authentication_token))
 ```
 
-Then seed it (stored at `~/.revenuecat/auth_token`, `chmod 600`, and
-self-refreshing thereafter):
+Seed it at `~/.revenuecat/auth_token`. It is stored with mode `600` and
+self-refreshes thereafter:
 
 ```bash
 ./rc-clean-test-users --reseed <paste-token>
@@ -96,40 +114,37 @@ self-refreshing thereafter):
 
 ```bash
 cd ~/my-app-repo
-./rc-clean-test-users            # dry run: list what WOULD be deleted
-./rc-clean-test-users --delete   # actually delete
-./rc-clean-test-users --all-apps # every app in your config (dry run unless --delete)
+./rc-clean-test-users                         # dry run for configured platforms
+./rc-clean-test-users --platform android      # Android only
+./rc-clean-test-users --platform android --delete
+./rc-clean-test-users --delete                # delete candidates for this app
+./rc-clean-test-users --all-apps              # all configured apps/platforms
+./rc-clean-test-users --all-apps --platform android
 ```
 
-Dry run is the default; nothing is deleted until you pass `--delete`.
-
-### Example
-
-```
-=== My App  (RC a1b2c3d4)  bundle com.you.app ===
-released versions: NONE — app not public
-scanning 12 customers...
-  real (kept): 0   purchasers (kept): 0   TEST: 12
-  test by version: (no detail)×5, 1.0.0×7
-  (dry run — pass --delete to remove these 12)
-```
+Dry run is the default; nothing is deleted until you pass `--delete`. For apps
+configured for both platforms, the default scans both. `--platform` can
+restrict a run to `ios`, `android`, or `all`.
 
 ## Configuration reference
 
 | What | Default | Override |
 | --- | --- | --- |
 | App map | `~/.rc-clean/apps.json` | `$RC_CLEAN_APPS` |
-| ASC creds | `~/.rc-clean/asc_credentials` | `$RC_CLEAN_ASC_CREDS` |
-| RC token | `~/.revenuecat/auth_token` | `$RC_CLEAN_TOKEN` |
+| ASC credentials | `~/.rc-clean/asc_credentials` | `$RC_CLEAN_ASC_CREDS` |
+| Google Play credentials | Per-app `google_play_credentials` | `$RC_CLEAN_GOOGLE_PLAY_CREDS` or `$GOOGLE_APPLICATION_CREDENTIALS` |
+| RevenueCat token | `~/.revenuecat/auth_token` | `$RC_CLEAN_TOKEN` |
 
 ## Notes
 
-- RevenueCat deletion is asynchronous; a deleted customer 404s within minutes
-  but may still appear in the enumeration index briefly. Re-running is safe and
-  idempotent.
-- Ghost/anonymous rows whose detail endpoint 404s are reported as stale and
-  skipped. They are already absent from the customer detail endpoint.
+- RevenueCat deletion is asynchronous. A deleted customer may still appear in
+  the enumeration index briefly. Re-running is safe and idempotent.
+- Customer rows whose RevenueCat detail endpoint returns 404 are reported as
+  stale and skipped. They are already absent from the customer detail endpoint.
+- Android release versions are matched by numeric Play release names. Unknown
+  Android versions are kept after production launch, so custom Play release
+  names cannot cause customers to be deleted by mistake.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT

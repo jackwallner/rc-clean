@@ -3,7 +3,15 @@
     "rc": "<revenuecat-project-id>",
     "asc": "<app-store-connect-app-id>",
     "name": "My App",
-    "allow_versions": []
+    "allow_versions": [],
+    "android": {
+      "name": "My App Android",
+      "rc": "<android-revenuecat-project-id>",
+      "package_name": "com.example.myapp",
+      "google_play_credentials": "~/.config/google-play/service-account.json",
+      "test_tracks": ["internal", "alpha", "beta"],
+      "allow_versions": []
+    }
   },
   "com.example.otherapp": {
     "rc": "<revenuecat-project-id>",
