@@ -363,6 +363,9 @@ def android_inventory(android, assume_unreleased=False):
                         os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"))
     api = GooglePlayAPI(credentials_path)
     package_name = android["package_name"]
+    platform_filter = android.get("filter_platform", "android")
+    if platform_filter != "android":
+        raise RuntimeError("Android projects must filter customers on last_seen_platform=android")
     production = api.track_releases(package_name, "production")
     production_found = production is not None
     if production is None:
@@ -545,7 +548,7 @@ def _log(msg=""):
 
 def ios_config(app):
     nested = app.get("ios")
-    config = nested if isinstance(nested, dict) else app
+    config = {**app, **nested} if isinstance(nested, dict) else app
     return config if config.get("rc") and config.get("asc") else None
 
 def android_config(app):
@@ -611,6 +614,7 @@ def clean_app(rc, bundle, do_delete, since_days=None, created_before=None):
     _log(f"scanning {len(ids)} customers...")
 
     test, stale_ghosts, kept_purchasers, real, allowlisted = [], set(), 0, 0, 0
+    platform_skipped = 0
     for i, uid in enumerate(ids):
         s = rc.customer(pid, uid)
         if not s:
@@ -618,6 +622,10 @@ def clean_app(rc, bundle, do_delete, since_days=None, created_before=None):
             # in its sample briefly. A 404 is stale index data, not a delete
             # candidate.
             stale_ghosts.add(uid)
+            continue
+        platform_filter = app.get("filter_platform")
+        if platform_filter and s.get("last_seen_platform") != platform_filter:
+            platform_skipped += 1
             continue
         if _has_real_purchase(s):
             kept_purchasers += 1; continue
@@ -648,6 +656,8 @@ def clean_app(rc, bundle, do_delete, since_days=None, created_before=None):
 
     if stale_ghosts:
         _log(f"  stale/absent rows skipped: {len(stale_ghosts)}")
+    if platform_skipped:
+        _log(f"  other-platform customers skipped: {platform_skipped}")
     _log(f"  real (kept): {real}   purchasers (kept): {kept_purchasers}   "
          f"allowlisted (kept): {allowlisted}   TEST: {len(test)}")
     byver = Counter(v for _, v, _, _ in test)
@@ -679,6 +689,7 @@ def clean_android_app(rc, bundle, do_delete, since_days=None, created_before=Non
     pid = android["rc"]
     name = android.get("name") or f"{root_app.get('name') or bundle} Android"
     package_name = android["package_name"]
+    platform_filter = android.get("filter_platform", "android")
     allow_versions = {canon(v) for v in
                       android.get("allow_versions", root_app.get("allow_versions", []))
                       if canon(v)}
@@ -726,11 +737,15 @@ def clean_android_app(rc, bundle, do_delete, since_days=None, created_before=Non
 
     test, stale_ghosts = [], 0
     kept_purchasers = kept_released = allowlisted = unknown = 0
+    platform_skipped = 0
     for i, uid in enumerate(ids):
         subscriber = rc.customer(pid, uid)
         if not subscriber:
             # Audience preview can briefly retain an already-absent customer.
             stale_ghosts += 1
+            continue
+        if subscriber.get("last_seen_platform") != platform_filter:
+            platform_skipped += 1
             continue
         if _has_real_purchase(subscriber):
             kept_purchasers += 1
@@ -765,6 +780,8 @@ def clean_android_app(rc, bundle, do_delete, since_days=None, created_before=Non
 
     if stale_ghosts:
         _log(f"  stale/absent rows skipped: {stale_ghosts}")
+    if platform_skipped:
+        _log(f"  other-platform customers skipped: {platform_skipped}")
     _log(f"  purchasers (kept): {kept_purchasers}   released-version (kept): "
          f"{kept_released}   allowlisted (kept): {allowlisted}   "
          f"unknown-version (kept): {unknown}   TEST: {len(test)}")

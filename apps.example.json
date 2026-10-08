@@ -8,6 +8,7 @@
       "name": "My App Android",
       "rc": "<android-revenuecat-project-id>",
       "package_name": "com.example.myapp",
+      "filter_platform": "android",
       "google_play_credentials": "~/.config/google-play/service-account.json",
       "test_tracks": ["internal", "alpha", "beta"],
       "allow_versions": []

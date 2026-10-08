@@ -57,6 +57,7 @@ cp apps.example.json ~/.rc-clean/apps.json
       "name": "Your App Android",
       "rc": "<android-revenuecat-project-id>",
       "package_name": "com.you.app",
+      "filter_platform": "android",
       "google_play_credentials": "~/.config/google-play/service-account.json",
       "test_tracks": ["internal", "alpha", "beta"],
       "allow_versions": []
@@ -69,6 +70,11 @@ Keep the existing top-level `rc` and `asc` fields for iOS. The nested
 `android` object is optional. Android-only apps can omit the top-level `rc` and
 `asc` fields. RevenueCat project ids are the short hashes in their dashboard
 URLs. `package_name` must match the package in Google Play Console.
+
+Android cleanup only considers customers whose `last_seen_platform` is
+`android`. If one RevenueCat project serves both iOS and Android, set
+`ios.filter_platform` to `iOS` in that app entry so the iOS cleaner skips
+Android customers too. Nested `ios` fields override the top-level iOS fields.
 
 `rc-clean` auto-detects the app by walking up to the nearest `project.yml`,
 Xcode project, or Android Gradle project and matching its bundle id or package
