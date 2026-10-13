@@ -18,7 +18,7 @@ seen before the first public release are candidates.
 For Android, it reads the Google Play production track and configured test
 tracks. If there is no published production release, non-purchasers are
 pre-release candidates. After production launch, only versions found on a
-published test track, sandbox-only customers, or non-purchasers selected by an
+published test track and newer than production, sandbox-only customers, or non-purchasers selected by an
 explicit `--created-before` cutoff are candidates. Unknown Android versions are
 kept. Play release names in `versionName`, `versionName (versionCode)`, or
 `versionCode (versionName)` form are matched to RevenueCat's app version. To

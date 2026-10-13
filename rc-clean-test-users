@@ -7,8 +7,8 @@ Google Play production and configured test tracks. An app with no published
 production release is treated as pre-release. After production launch, an
 Android customer is only classified from a version that appears on a published
 test track, a sandbox-only purchase, or an explicit --created-before cutoff.
-Unknown Android versions are kept. Customers on RevenueCat's Test Store
-are always test. Any real purchase is always kept.
+Unknown Android versions, and test-track versions older than production, are
+kept. Customers on RevenueCat's Test Store are always test. Any real purchase is always kept.
 
 Run it from inside an app's repo (auto-detects the app from its bundle id):
     rc-clean-test-users                    # dry run for configured platforms
@@ -383,6 +383,14 @@ def _write_play_cache(cache):
         os.replace(tmp, PLAY_CACHE_FILE)
     except OSError:
         pass
+
+def _version_key(version):
+    parts = [int(x) for x in canon(version).split(".") if x.isdigit()]
+    return parts + [0] * (4 - len(parts))
+
+def _newer_than_all(version, released):
+    """True if version is newer than every published production version."""
+    return all(_version_key(version) > _version_key(r) for r in released)
 
 def play_version(release_name):
     """Extract versionName from Play's versionName/code display variants."""
@@ -825,7 +833,10 @@ def clean_android_app(rc, bundle, do_delete, since_days=None, created_before=Non
             reason = "pre-release"
         elif created_before and created and created < created_before:
             reason = "pre-approval"
-        elif normalized in inv["test_versions"] - inv["released"]:
+        elif (normalized in inv["test_versions"] - inv["released"] and
+              _newer_than_all(normalized, inv["released"])):
+            # Play lists only current releases, so a test-track version older
+            # than production may be a past production release. Keep it.
             reason = "play-test-track"
         elif _is_sandbox_only(subscriber):
             reason = "sandbox"
