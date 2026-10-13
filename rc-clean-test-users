@@ -7,7 +7,8 @@ Google Play production and configured test tracks. An app with no published
 production release is treated as pre-release. After production launch, an
 Android customer is only classified from a version that appears on a published
 test track, a sandbox-only purchase, or an explicit --created-before cutoff.
-Unknown Android versions are kept. Any real purchase is always kept.
+Unknown Android versions are kept. Customers on RevenueCat's Test Store
+are always test. Any real purchase is always kept.
 
 Run it from inside an app's repo (auto-detects the app from its bundle id):
     rc-clean-test-users                    # dry run for configured platforms
@@ -551,6 +552,11 @@ def _is_sandbox_only(s):
         return True
     return False
 
+def _is_test_store(s):
+    """RevenueCat's Test Store key can never take real money, whatever the version."""
+    app = s.get("last_seen_mobile_app") or {}
+    return app.get("type") == "test_store"
+
 def _log(msg=""):
     print(msg, flush=True)
 
@@ -630,6 +636,10 @@ def clean_app(rc, bundle, do_delete, since_days=None, created_before=None):
             # in its sample briefly. A 404 is stale index data, not a delete
             # candidate.
             stale_ghosts.add(uid)
+            continue
+        if _is_test_store(s) and not _has_real_purchase(s):
+            test.append((uid, s.get("last_seen_app_version") or "(none)",
+                         (s.get("created_at") or "")[:10], "test-store"))
             continue
         platform_filter = app.get("filter_platform")
         if platform_filter and s.get("last_seen_platform") != platform_filter:
@@ -751,6 +761,10 @@ def clean_android_app(rc, bundle, do_delete, since_days=None, created_before=Non
         if not subscriber:
             # Audience preview can briefly retain an already-absent customer.
             stale_ghosts += 1
+            continue
+        if _is_test_store(subscriber) and not _has_real_purchase(subscriber):
+            test.append((uid, subscriber.get("last_seen_app_version") or "(none)",
+                         (subscriber.get("created_at") or "")[:10], "test-store"))
             continue
         if subscriber.get("last_seen_platform") != platform_filter:
             platform_skipped += 1

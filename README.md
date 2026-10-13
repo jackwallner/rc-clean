@@ -2,7 +2,8 @@
 
 A CLI that removes test customers from configured [RevenueCat](https://www.revenuecat.com/)
 projects. It checks App Store and TestFlight releases for iOS, and Google Play
-production and test tracks for Android. Real purchasers are always kept.
+production and test tracks for Android. Customers last seen on RevenueCat's
+Test Store are always candidates. Real purchasers are always kept.
 
 ## Classification rules
 
