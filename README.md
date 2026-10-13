@@ -19,9 +19,10 @@ tracks. If there is no published production release, non-purchasers are
 pre-release candidates. After production launch, only versions found on a
 published test track, sandbox-only customers, or non-purchasers selected by an
 explicit `--created-before` cutoff are candidates. Unknown Android versions are
-kept. Play release names in `versionName` or `versionName (versionCode)` form
-are matched to RevenueCat's app version. To clean a pre-release cohort after
-launch, use `--created-before` with a cutoff after that cohort. If a test-track
+kept. Play release names in `versionName`, `versionName (versionCode)`, or
+`versionCode (versionName)` form are matched to RevenueCat's app version. To
+clean a pre-release cohort after launch, use `--created-before` with a cutoff
+after that cohort. If a test-track
 lookup is unavailable after production launch, versions from that track are
 treated as unknown and kept. `--assume-unreleased` skips Play reads for a single
 Android app run when its unreleased state is already confirmed. It requires

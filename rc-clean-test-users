@@ -344,11 +344,19 @@ class GooglePlayAPI:
         return releases
 
 def play_version(release_name):
-    """Extract a versionName from Play's default 'versionName (versionCode)' name."""
+    """Extract versionName from Play's versionName/code display variants."""
     if not release_name:
         return ""
-    match = re.fullmatch(r"\s*(\d+(?:\.\d+)*)(?:\s+\(\d+\))?\s*", str(release_name))
-    return canon(match.group(1)) if match else ""
+    text = str(release_name).strip()
+    match = re.fullmatch(r"(\d+(?:\.\d+)*)\s+\((\d+(?:\.\d+)*)\)", text)
+    if match:
+        first, second = match.groups()
+        # Play can format a release as either "versionName (versionCode)" or
+        # "versionCode (versionName)". Version codes are integers; a dotted
+        # value in the parentheses therefore identifies the reversed form.
+        version = second if "." not in first and "." in second else first
+        return canon(version)
+    return canon(text) if re.fullmatch(r"\d+(?:\.\d+)*", text) else ""
 
 def android_inventory(android, assume_unreleased=False):
     if assume_unreleased:
