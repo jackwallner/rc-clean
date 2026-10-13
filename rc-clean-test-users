@@ -28,6 +28,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 import urllib.parse
 from collections import Counter
@@ -42,6 +43,12 @@ GOOGLE_PLAY = "https://androidpublisher.googleapis.com/androidpublisher/v3"
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GOOGLE_PLAY_SCOPE = "https://www.googleapis.com/auth/androidpublisher"
 HTTP_TIMEOUT = (10, 60)
+# Google Play caps release listings per day, so published track reads are
+# reused for this long. An unpublished production read is never cached: the
+# launch has to be seen on the next run or new real customers look pre-release.
+PLAY_CACHE_FILE = os.path.expanduser(os.path.expandvars(
+    os.environ.get("RC_CLEAN_PLAY_CACHE", "~/.rc-clean/play-tracks.json")))
+PLAY_CACHE_SECONDS = 20 * 3600
 def die(msg, code=1):
     print(f"error: {msg}", file=sys.stderr); sys.exit(code)
 
@@ -315,6 +322,21 @@ class GooglePlayAPI:
         return self.access_token
 
     def track_releases(self, package_name, track):
+        key = f"{package_name}/{track}"
+        cache = _read_play_cache()
+        hit = cache.get(key)
+        if hit and time.time() - hit.get("fetched", 0) < PLAY_CACHE_SECONDS:
+            return hit.get("releases")
+        releases = self._fetch_track_releases(package_name, track)
+        published = any(r.get("releaseLifecycleState") == "RELEASE_LIFECYCLE_STATE_PUBLISHED"
+                        for r in releases or [])
+        if track != "production" or published:
+            cache = _read_play_cache()
+            cache[key] = {"fetched": time.time(), "releases": releases}
+            _write_play_cache(cache)
+        return releases
+
+    def _fetch_track_releases(self, package_name, track):
         package = urllib.parse.quote(package_name, safe="")
         track_id = urllib.parse.quote(track, safe="")
         url = f"{GOOGLE_PLAY}/applications/{package}/tracks/{track_id}/releases"
@@ -343,6 +365,24 @@ class GooglePlayAPI:
         if not isinstance(releases, list):
             raise RuntimeError(f"Google Play returned an invalid release list for track {track}")
         return releases
+
+def _read_play_cache():
+    try:
+        with open(PLAY_CACHE_FILE) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+def _write_play_cache(cache):
+    tmp = f"{PLAY_CACHE_FILE}.{os.getpid()}.{threading.get_ident()}.tmp"
+    try:
+        os.makedirs(os.path.dirname(PLAY_CACHE_FILE), exist_ok=True)
+        with open(tmp, "w") as f:
+            json.dump(cache, f)
+        os.replace(tmp, PLAY_CACHE_FILE)
+    except OSError:
+        pass
 
 def play_version(release_name):
     """Extract versionName from Play's versionName/code display variants."""
