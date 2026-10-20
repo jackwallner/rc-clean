@@ -133,11 +133,47 @@ cd ~/my-app-repo
 ./rc-clean-test-users --delete                # delete candidates for this app
 ./rc-clean-test-users --all-apps              # all configured apps/platforms
 ./rc-clean-test-users --all-apps --platform android
+./rc-clean-test-users --check-coverage         # read-only account coverage check
 ```
 
 Dry run is the default; nothing is deleted until you pass `--delete`. For apps
 configured for both platforms, the default scans both. `--platform` can
 restrict a run to `ios`, `android`, or `all`.
+
+Every all-platform `--all-apps` run checks the account's RevenueCat project
+inventory. Missing projects or an unavailable inventory produce a nonzero exit
+status while configured apps still run. Add new projects to the private app map
+before considering the scheduled job healthy. Rejected customer deletions also
+produce a nonzero exit status on either platform.
+Apple connection failures, timeouts, throttling, and transient server errors
+receive up to four attempts. Persistent failures remain errors; authentication
+and permission errors are not retried.
+
+For a project without accessible App Store Connect release metadata, configure
+`{"rc": "<project-id>", "name": "Your App", "test_store_only": true}`.
+This explicit mode removes only confirmed Test Store customers without real
+purchases. It keeps every other customer and never guesses release status.
+
+## Scheduled runs
+
+Install `scripts/rc-clean-runner.py` and `scripts/rc-clean-cron.sh` in `~/bin`
+alongside the cleaner. The shell entry point uses `~/.rc-clean/venv/bin/python`.
+An existing launchd schedule can continue invoking `~/bin/rc-clean-cron.sh`.
+
+The runner takes a kernel-managed lock at `~/.rc-clean/run.flock`. Crashed
+processes leave no stale directory lock, and overlapping launches skip safely.
+The child inherits the lock so an interrupted runner cannot permit an overlap
+while cleanup is still active. Runs time out after three hours and terminate
+their child process group. A successful run updates `last-success`; only a
+successful full sweep advances `last-full-sweep`. The daily full sweep and
+three-day incremental window retain the existing schedule behavior.
+
+Logs remain in `~/Library/Logs/rc-clean.log`, including timestamped start and
+exit markers for the existing watchdog. The runner supports `--script`,
+`--state-dir`, `--log`, and `--timeout` for isolated verification.
+
+Run reliability checks with `python -m unittest discover -s tests -v` in an
+environment with the cleaner's dependencies installed.
 
 ## Configuration reference
 

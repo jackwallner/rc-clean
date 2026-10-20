@@ -149,10 +149,19 @@ def asc_token():
                       headers={"kid": env["ASC_API_KEY_ID"], "typ": "JWT"})
 
 def _asc_get(path, headers, params=None):
-    r = requests.get(f"{ASC}{path}", headers=headers, params=params or {},
-                     timeout=HTTP_TIMEOUT)
-    r.raise_for_status()
-    return r.json()
+    for attempt in range(4):
+        try:
+            response = requests.get(f"{ASC}{path}", headers=headers,
+                                    params=params or {}, timeout=HTTP_TIMEOUT)
+            response.raise_for_status()
+            return response.json()
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+            if attempt == 3:
+                raise
+        except requests.exceptions.HTTPError:
+            if response.status_code not in (429, 500, 502, 503, 504) or attempt == 3:
+                raise
+        time.sleep(1.5 * (attempt + 1))
 
 def itunes_release_date(asc_app_id):
     """Return Apple's public first-release date when the app is listed."""
@@ -469,6 +478,17 @@ def android_inventory(android, assume_unreleased=False):
         test_versions.update(
             version for release in active
             if (version := play_version(release.get("releaseName"))))
+    if not verified and not unavailable_tracks:
+        # Every track read was a 404: the package does not exist on Google
+        # Play (a missing grant is a 403 and raises above), so no customer
+        # can have installed it from the store.
+        return {"has_public_release": False,
+                "not_on_play": True,
+                "released": set(),
+                "test_versions": set(),
+                "production": [],
+                "test_tracks": {},
+                "unavailable_tracks": {}}
     if not verified:
         raise RuntimeError(
             f"Google Play could not verify package {package_name}; "
@@ -611,7 +631,25 @@ def _log(msg=""):
 def ios_config(app):
     nested = app.get("ios")
     config = {**app, **nested} if isinstance(nested, dict) else app
-    return config if config.get("rc") and config.get("asc") else None
+    return config if config.get("rc") and (config.get("asc") or
+                                           config.get("test_store_only") is True) else None
+
+def check_coverage(rc, apps):
+    response = rc.get("/v1/developers/me")
+    response.raise_for_status()
+    projects = response.json().get("apps")
+    if not isinstance(projects, list) or not projects:
+        raise RuntimeError("RevenueCat project inventory is missing or empty")
+    configured = set()
+    for app in apps.values():
+        for config in (ios_config(app), android_config(app)):
+            if config:
+                configured.add(config["rc"].removeprefix("proj"))
+    missing = [project for project in projects if project["id"] not in configured]
+    for project in missing:
+        _log(f"ERROR unconfigured RevenueCat project: {project['name']} ({project['id']})")
+    _log(f"project coverage: {len(projects) - len(missing)}/{len(projects)}")
+    return not missing
 
 def android_config(app):
     config = app.get("android")
@@ -627,7 +665,9 @@ def clean_app(rc, bundle, do_delete, since_days=None, created_before=None):
     pid = app["rc"]
     name = app.get("name") or root_app.get("name") or bundle
     allow_versions = {canon(v) for v in app.get("allow_versions", []) if canon(v)}
-    inv = asc_inventory(app["asc"])
+    test_store_only = app.get("test_store_only") is True
+    inv = ({"released": set(), "pending": set(), "tf_only": set(),
+            "store": [], "tf": []} if test_store_only else asc_inventory(app["asc"]))
     released, pending, tf_only = inv["released"], inv["pending"], inv["tf_only"]
     never_public = len(released) == 0
     public_release = inv.get("public_release_date")
@@ -647,7 +687,10 @@ def clean_app(rc, bundle, do_delete, since_days=None, created_before=None):
     _log(f"\n=== {name}  (RC {pid})  bundle {bundle} ===")
     _log(f"window: {start.isoformat()} → {end.isoformat()}  "
          f"({'last '+str(since_days)+'d' if since_days is not None else 'YTD'})")
-    _log(f"released (READY_FOR_SALE): {sorted(released) if released else 'NONE — app not public'}")
+    if test_store_only:
+        _log("Test Store only: release metadata unavailable; other customers are kept")
+    else:
+        _log(f"released (READY_FOR_SALE): {sorted(released) if released else 'NONE; app not public'}")
     if public_release:
         _log(f"first public release:    {public_release[:19]}")
     elif earliest_release:
@@ -688,6 +731,12 @@ def clean_app(rc, bundle, do_delete, since_days=None, created_before=None):
         if _is_test_store(s) and not _has_real_purchase(s):
             test.append((uid, s.get("last_seen_app_version") or "(none)",
                          (s.get("created_at") or "")[:10], "test-store"))
+            continue
+        if test_store_only:
+            if _has_real_purchase(s):
+                kept_purchasers += 1
+            else:
+                real += 1
             continue
         platform_filter = app.get("filter_platform")
         if platform_filter and s.get("last_seen_platform") != platform_filter:
@@ -742,8 +791,10 @@ def clean_app(rc, bundle, do_delete, since_days=None, created_before=None):
             if rc.delete_customer(pid, uid): ok += 1
             time.sleep(0.08)
         _log(f"  deleted {ok}/{len(test)}")
+        if ok != len(test):
+            raise RuntimeError(f"RevenueCat rejected {len(test) - ok} customer deletions")
     elif test:
-        _log(f"  (dry run — pass --delete to remove these {len(test)})")
+        _log(f"  (dry run; pass --delete to remove these {len(test)})")
     return len(test)
 
 def clean_android_app(rc, bundle, do_delete, since_days=None, created_before=None,
@@ -774,7 +825,9 @@ def clean_android_app(rc, bundle, do_delete, since_days=None, created_before=Non
          f"{sorted(inv['released']) if inv['released'] else 'NONE'}")
     if assume_unreleased:
         _log("using one-run unreleased override")
-    if not inv["has_public_release"]:
+    if inv.get("not_on_play"):
+        _log("package is not on Google Play yet")
+    elif not inv["has_public_release"]:
         _log("production release is not published")
     pending_production = [
         release for release in inv["production"]
@@ -900,6 +953,8 @@ def main():
     ap = argparse.ArgumentParser(description="Delete RevenueCat test customers for the current app.")
     ap.add_argument("--delete", action="store_true", help="actually delete (default: dry run)")
     ap.add_argument("--all-apps", action="store_true", help="run for every configured app")
+    ap.add_argument("--check-coverage", action="store_true",
+                    help="check project coverage without scanning or deleting customers")
     ap.add_argument("--platform", choices=("all", "ios", "android"), default="all",
                     help="platforms to scan (default: all configured platforms)")
     ap.add_argument("--assume-unreleased", action="store_true",
@@ -929,7 +984,19 @@ def main():
 
     # one shared RC session; each worker uses it (token refresh is serialized enough)
     rc = RC_API()
+    if args.check_coverage:
+        try:
+            return 0 if check_coverage(rc, APPS) else 1
+        except Exception as e:
+            die(f"project coverage check failed: {e}")
     if args.all_apps:
+        coverage_ok = True
+        if args.platform == "all":
+            try:
+                coverage_ok = check_coverage(rc, APPS)
+            except Exception as e:
+                coverage_ok = False
+                _log(f"ERROR project coverage check failed: {e}")
         bundles = [bundle for bundle, app in APPS.items()
                    if args.platform == "all" or
                    (args.platform == "ios" and ios_config(app)) or
@@ -973,7 +1040,7 @@ def main():
         if errors:
             _log(f"FAILED apps: {len(errors)}/{len(bundles)}")
             return 1
-        return 0
+        return 0 if coverage_ok else 1
 
     bundle = detect_bundle()
     if not bundle:
