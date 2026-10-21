@@ -657,6 +657,15 @@ def android_config(app):
         return None
     return config if config.get("rc") and config.get("package_name") else None
 
+def scan_window(since_days):
+    """RevenueCat buckets firstSeenAt by UTC date, which runs ahead of local
+    time every evening, so the window is anchored on the UTC date."""
+    today = datetime.datetime.now(datetime.timezone.utc).date()
+    end = today + datetime.timedelta(days=1)
+    if since_days is None:
+        return datetime.date(2026, 1, 1), end
+    return today - datetime.timedelta(days=since_days), end
+
 def clean_app(rc, bundle, do_delete, since_days=None, created_before=None):
     root_app = APPS[bundle]
     app = ios_config(root_app)
@@ -678,11 +687,7 @@ def clean_app(rc, bundle, do_delete, since_days=None, created_before=None):
     # anything not READY_FOR_SALE is test — pending submissions + TF-only builds
     test_versions = pending | tf_only
 
-    end = datetime.date.today() + datetime.timedelta(days=1)
-    if since_days is None:
-        start = datetime.date(2026, 1, 1)
-    else:
-        start = datetime.date.today() - datetime.timedelta(days=since_days)
+    start, end = scan_window(since_days)
 
     _log(f"\n=== {name}  (RC {pid})  bundle {bundle} ===")
     _log(f"window: {start.isoformat()} → {end.isoformat()}  "
@@ -812,11 +817,7 @@ def clean_android_app(rc, bundle, do_delete, since_days=None, created_before=Non
                       if canon(v)}
     inv = android_inventory(android, assume_unreleased)
 
-    end = datetime.date.today() + datetime.timedelta(days=1)
-    if since_days is None:
-        start = datetime.date(2026, 1, 1)
-    else:
-        start = datetime.date.today() - datetime.timedelta(days=since_days)
+    start, end = scan_window(since_days)
 
     _log(f"\n=== {name}  (RC {pid})  package {package_name} ===")
     _log(f"window: {start.isoformat()} to {end.isoformat()}  "
