@@ -620,6 +620,10 @@ def _is_sandbox_only(s):
         return True
     return False
 
+# Debug, simulator and emulator builds log in as one of these instead of a
+# fresh anonymous customer per install. They are test by definition.
+QA_USER_IDS = ("qa-ios", "qa-android")
+
 def _is_test_store(s):
     """RevenueCat's Test Store key can never take real money, whatever the version."""
     app = s.get("last_seen_mobile_app") or {}
@@ -736,6 +740,10 @@ def clean_app(rc, bundle, do_delete, since_days=None, created_before=None):
         if _is_test_store(s) and not _has_real_purchase(s):
             test.append((uid, s.get("last_seen_app_version") or "(none)",
                          (s.get("created_at") or "")[:10], "test-store"))
+            continue
+        if uid in QA_USER_IDS and not _has_real_purchase(s):
+            test.append((uid, s.get("last_seen_app_version") or "(none)",
+                         (s.get("created_at") or "")[:10], "qa-tester"))
             continue
         if test_store_only:
             if _has_real_purchase(s):
@@ -868,6 +876,10 @@ def clean_android_app(rc, bundle, do_delete, since_days=None, created_before=Non
             test.append((uid, subscriber.get("last_seen_app_version") or "(none)",
                          (subscriber.get("created_at") or "")[:10], "test-store"))
             continue
+        if uid in QA_USER_IDS and not _has_real_purchase(subscriber):
+            test.append((uid, subscriber.get("last_seen_app_version") or "(none)",
+                         (subscriber.get("created_at") or "")[:10], "qa-tester"))
+            continue
         if subscriber.get("last_seen_platform") != platform_filter:
             platform_skipped += 1
             continue
@@ -950,6 +962,19 @@ def clean_bundle(rc, bundle, do_delete, since_days=None, created_before=None,
                 rc, bundle, do_delete, since_days, created_before, assume_unreleased)
     return total
 
+def reset_qa(rc, bundles):
+    """Delete the shared QA testers so the next debug run starts unpaid."""
+    pids = {config["rc"] for bundle in bundles
+            for config in (ios_config(APPS[bundle]), android_config(APPS[bundle])) if config}
+    deleted = 0
+    for pid in sorted(pids):
+        for uid in QA_USER_IDS:
+            if rc.customer(pid, uid) and rc.delete_customer(pid, uid):
+                deleted += 1
+                _log(f"deleted {uid} in RC {pid}")
+    _log(f"QA testers deleted: {deleted}")
+    return 0
+
 def main():
     ap = argparse.ArgumentParser(description="Delete RevenueCat test customers for the current app.")
     ap.add_argument("--delete", action="store_true", help="actually delete (default: dry run)")
@@ -966,6 +991,8 @@ def main():
                     help="flag non-purchaser customers created before YYYY-MM-DD as test (e.g. pre-approval TF users)")
     ap.add_argument("--jobs", type=int, default=1, metavar="N",
                     help="parallel apps when using --all-apps (default: 1)")
+    ap.add_argument("--reset-qa", action="store_true",
+                    help="delete the shared qa-ios/qa-android testers and exit")
     ap.add_argument("--reseed", metavar="TOKEN", help="store a fresh RevenueCat dashboard token and exit")
     args = ap.parse_args()
 
@@ -985,6 +1012,11 @@ def main():
 
     # one shared RC session; each worker uses it (token refresh is serialized enough)
     rc = RC_API()
+    if args.reset_qa:
+        bundles = list(APPS) if args.all_apps else [detect_bundle()]
+        if not bundles[0]:
+            die("couldn't detect the app from this folder. cd into an app repo, or use --all-apps.")
+        return reset_qa(rc, bundles)
     if args.check_coverage:
         try:
             return 0 if check_coverage(rc, APPS) else 1

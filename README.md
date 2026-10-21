@@ -134,7 +134,14 @@ cd ~/my-app-repo
 ./rc-clean-test-users --all-apps              # all configured apps/platforms
 ./rc-clean-test-users --all-apps --platform android
 ./rc-clean-test-users --check-coverage         # read-only account coverage check
+./rc-clean-test-users --reset-qa               # delete the shared qa-ios/qa-android testers
 ```
+
+Debug, simulator and emulator builds should configure RevenueCat with the fixed
+app user ID `qa-ios` or `qa-android` instead of an anonymous one. Every test
+install then reuses one customer, so test runs add at most one Active Customer
+a day instead of one per install. The cleaner always treats those IDs as test,
+and `--reset-qa` deletes them so the next run starts unpaid.
 
 Dry run is the default; nothing is deleted until you pass `--delete`. For apps
 configured for both platforms, the default scans both. `--platform` can
